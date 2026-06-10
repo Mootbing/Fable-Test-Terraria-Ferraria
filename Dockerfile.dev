@@ -1,0 +1,7 @@
+FROM rust:1
+RUN rustup target add wasm32-unknown-unknown && rustup component add rustfmt clippy
+# Native client builds (optional; wasm is the shipping target) need windowing/GL/audio headers.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libx11-dev libxi-dev libgl1-mesa-dev libasound2-dev \
+    && rm -rf /var/lib/apt/lists/*
+CMD ["sleep", "infinity"]

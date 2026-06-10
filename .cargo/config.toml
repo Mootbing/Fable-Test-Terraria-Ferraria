@@ -1,0 +1,5 @@
+# miniquad's browser-side functions (init_webgl, canvas_width, ...) are provided
+# at runtime by web/mq_js_bundle.js; tell the wasm linker to import rather than
+# reject undefined symbols. Required on rustc >= 1.87.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-args=--import-undefined"]

@@ -1,0 +1,6 @@
+/target
+**/target
+/web/ferraria-client.wasm
+/data
+*.world
+.env

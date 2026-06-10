@@ -1,0 +1,30 @@
+[workspace]
+members = ["crates/shared", "crates/server", "crates/client"]
+# The client only ships as wasm32 and needs an explicit --target; keep it out of
+# default builds so `cargo build`/`cargo test` at the root covers shared+server.
+default-members = ["crates/shared", "crates/server"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+macroquad = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+# Keep wasm small-ish but fast to build during dev.
+[profile.release.package.ferraria-client]
+opt-level = "s"
