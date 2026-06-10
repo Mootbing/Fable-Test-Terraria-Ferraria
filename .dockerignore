@@ -1,0 +1,5 @@
+target
+data
+.git
+web/ferraria-client.wasm
+Dockerfile.dev
