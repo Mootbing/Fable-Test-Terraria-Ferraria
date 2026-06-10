@@ -28,6 +28,12 @@ scripts/build-web.sh                      # client -> web/ferraria-client.wasm
 scripts/dev.sh cargo run -p ferraria-server   # http://localhost:3000
 ```
 
+Open `http://localhost:3000`, enter a name, and Join. A/D or arrows to move,
+Space to jump (hold to rise; S+Space drops through platforms), Enter to chat,
+F3 for the debug overlay. Env vars: `PORT` (3000), `WORLD_SEED` (42),
+`WEB_DIR` (`web`). `scripts/check.sh` runs the full gate (fmt, clippy
+native+wasm, tests, wasm build) that every PR must pass.
+
 ## Deployment
 
 Railway, via the root `Dockerfile` (multi-stage: builds wasm client + release

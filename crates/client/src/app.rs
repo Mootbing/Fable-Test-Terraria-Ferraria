@@ -118,64 +118,63 @@ fn connecting_frame(
     token: Option<AuthToken>,
 ) -> Option<State> {
     let client = ws.as_mut()?;
-    match client.status() {
-        WsStatus::Closed => {
-            return Some(State::Disconnected {
-                reason: "could not reach the server".into(),
-            })
-        }
-        WsStatus::Connecting => {}
-        WsStatus::Open => {
-            if !*hello_sent {
-                *hello_sent = true;
-                client.send(&ClientMessage::Hello {
-                    protocol_version: PROTOCOL_VERSION,
-                    name: name.trim().to_string(),
+    let status = client.status();
+    if status == WsStatus::Open && !*hello_sent {
+        *hello_sent = true;
+        client.send(&ClientMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            name: name.trim().to_string(),
+            token,
+        });
+    }
+    if status != WsStatus::Connecting {
+        // Drain even when the socket already closed: a rejecting server
+        // sends `Reject` and immediately closes, and that reason must win
+        // over the generic message below.
+        let msgs = client.drain();
+        let mut iter = msgs.into_iter();
+        for msg in iter.by_ref() {
+            match msg {
+                ServerMessage::Welcome {
+                    player_id,
                     token,
-                });
-            }
-            let msgs = client.drain();
-            let mut iter = msgs.into_iter();
-            for msg in iter.by_ref() {
-                match msg {
-                    ServerMessage::Welcome {
-                        player_id,
-                        token,
-                        world_width,
-                        world_height,
-                        spawn,
-                        time,
-                        day,
-                        flags,
-                    } => {
-                        let ws = ws.take()?;
-                        let mut session = Session::new(
-                            ws,
-                            name.trim().to_string(),
-                            Welcome {
-                                player_id,
-                                token,
-                                world_width,
-                                world_height,
-                                spawn,
-                                time,
-                                day,
-                                flags,
-                            },
-                        );
-                        let now = get_time();
-                        for rest in iter {
-                            session.apply(rest, now);
-                        }
-                        return Some(State::Playing(Box::new(session)));
+                    world_width,
+                    world_height,
+                    spawn,
+                    time,
+                    day,
+                    flags,
+                } => {
+                    let ws = ws.take()?;
+                    let mut session = Session::new(
+                        ws,
+                        name.trim().to_string(),
+                        Welcome {
+                            player_id,
+                            token,
+                            world_width,
+                            world_height,
+                            spawn,
+                            time,
+                            day,
+                            flags,
+                        },
+                    );
+                    let now = get_time();
+                    for rest in iter {
+                        session.apply(rest, now);
                     }
-                    ServerMessage::Reject { reason } => {
-                        return Some(State::Disconnected { reason })
-                    }
-                    _ => {} // nothing else is valid pre-Welcome; ignore
+                    return Some(State::Playing(Box::new(session)));
                 }
+                ServerMessage::Reject { reason } => return Some(State::Disconnected { reason }),
+                _ => {} // nothing else is valid pre-Welcome; ignore
             }
         }
+    }
+    if status == WsStatus::Closed {
+        return Some(State::Disconnected {
+            reason: "could not reach the server".into(),
+        });
     }
     if get_time() - started > CONNECT_TIMEOUT_SECS {
         return Some(State::Disconnected {
