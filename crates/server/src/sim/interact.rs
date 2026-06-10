@@ -578,3 +578,503 @@ impl Sim {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::entities::EntityKind;
+    use super::super::game::Sim;
+    use super::super::test_util::*;
+    use super::*;
+    use ferraria_shared::items::InvSlot;
+    use ferraria_shared::protocol::ClientMessage;
+    use ferraria_shared::tiles::Tile;
+    use tokio::sync::mpsc;
+
+    const FLOOR: u32 = 30;
+
+    /// Sim + one joined player standing on the floor near the middle.
+    fn setup() -> (Sim, u32, u64, mpsc::Receiver<super::super::game::Frame>) {
+        let mut sim = flat_sim(100, 60, FLOOR);
+        let (id, epoch, mut rx) = join(&mut sim, "miner");
+        drain(&mut rx);
+        place_player(&mut sim, id, 50.0, FLOOR as f32);
+        (sim, id, epoch, rx)
+    }
+
+    fn set(sim: &mut Sim, x: u32, y: u32, id: TileId) {
+        let mut t = sim.world().tile(x, y);
+        t.id = id;
+        t.state = 0;
+        sim.change_tile(x, y, t);
+    }
+
+    /// Counts how many of `item` are sitting in drop entities.
+    fn dropped(sim: &Sim, item: ItemId) -> u32 {
+        sim.entities
+            .map
+            .values()
+            .map(|e| match e.kind {
+                EntityKind::ItemDrop { item: i, count } if i == item => count as u32,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// Swings until `(x, y)` breaks; returns how many swings it took.
+    fn swings_to_break(sim: &mut Sim, id: u32, epoch: u64, x: u32, y: u32, max: u32) -> Option<u32> {
+        for n in 1..=max {
+            swing_tile(sim, id, epoch, x, y);
+            if sim.world().tile(x, y).id == TileId::Air {
+                return Some(n);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn mining_math_per_tier_and_hellstone_gate() {
+        let (mut sim, id, epoch, _rx) = setup();
+        // §2/§4.1: swings = ceil(100 / (power × mult)).
+        let cases: [(ItemId, TileId, u32); 5] = [
+            (ItemId::WoodPickaxe, TileId::Dirt, 2),     // 25×2 = 50
+            (ItemId::WoodPickaxe, TileId::Stone, 4),    // 25×1 = 25
+            (ItemId::SilverPickaxe, TileId::SilverOre, 3), // 45×0.75 = 33.75
+            (ItemId::GoldPickaxe, TileId::Hellstone, 4), // 55×0.5 = 27.5
+            (ItemId::EmberPickaxe, TileId::Obsidian, 2), // 100×0.5 = 50
+        ];
+        // Two tiles of margin past the pickup radius: drops arc toward the
+        // player but must never be auto-collected mid-test.
+        let (x, y) = (54, FLOOR - 1);
+        for (tool, tile, expect) in cases {
+            set(&mut sim, x, y, tile);
+            give(&mut sim, id, 0, tool, 1);
+            let got = swings_to_break(&mut sim, id, epoch, x, y, 10);
+            assert_eq!(got, Some(expect), "{tool:?} vs {tile:?}");
+        }
+
+        // Hellstone gate: a 45-power pick deals zero damage forever.
+        set(&mut sim, x, y, TileId::Hellstone);
+        give(&mut sim, id, 0, ItemId::SilverPickaxe, 1);
+        assert_eq!(swings_to_break(&mut sim, id, epoch, x, y, 10), None);
+        assert!(sim.tile_damage.is_empty(), "no damage accumulated");
+
+        // Wrong tool class: axes don't mine stone, picks don't chop trees.
+        set(&mut sim, x, y, TileId::Stone);
+        give(&mut sim, id, 0, ItemId::EmberAxe, 1);
+        assert_eq!(swings_to_break(&mut sim, id, epoch, x, y, 5), None);
+        set(&mut sim, x, y, TileId::TreeTrunk);
+        give(&mut sim, id, 0, ItemId::EmberPickaxe, 1);
+        assert_eq!(swings_to_break(&mut sim, id, epoch, x, y, 5), None);
+    }
+
+    #[test]
+    fn broken_tiles_drop_their_item_and_announce_cracks() {
+        let (mut sim, id, epoch, mut rx) = setup();
+        let (x, y) = (55, FLOOR - 1);
+        set(&mut sim, x, y, TileId::Stone);
+        give(&mut sim, id, 0, ItemId::WoodPickaxe, 1);
+        drain(&mut rx);
+        let mut fracs = Vec::new();
+        for _ in 0..4 {
+            swing_tile(&mut sim, id, epoch, x, y);
+            for m in drain(&mut rx) {
+                if let ServerMessage::BlockCrack {
+                    x: cx,
+                    y: cy,
+                    damage_frac,
+                } = m
+                {
+                    assert_eq!((cx, cy), (x, y));
+                    fracs.push(damage_frac);
+                }
+            }
+        }
+        // 3 partial hits crack (25/50/75 points), the 4th breaks.
+        assert_eq!(fracs.len(), 3, "cracks: {fracs:?}");
+        assert!(fracs.windows(2).all(|w| w[0] < w[1]), "increasing {fracs:?}");
+        assert_eq!(sim.world().tile(x, y).id, TileId::Air);
+        assert_eq!(dropped(&sim, ItemId::Stone), 1);
+    }
+
+    #[test]
+    fn swing_rate_is_enforced_with_one_tick_jitter() {
+        let (mut sim, id, epoch, _rx) = setup();
+        let (x, y) = (54, FLOOR - 1);
+        // Wood pickaxe: 0.30 s = 18 ticks per swing; dirt dies in 2 swings.
+        give(&mut sim, id, 0, ItemId::WoodPickaxe, 1);
+
+        // Back-to-back swings: the second is ignored.
+        set(&mut sim, x, y, TileId::Dirt);
+        msg(&mut sim, id, epoch, ClientMessage::HitTile { x, y });
+        advance(&mut sim, 1);
+        msg(&mut sim, id, epoch, ClientMessage::HitTile { x, y });
+        assert_eq!(sim.world().tile(x, y).id, TileId::Dirt, "spam rejected");
+
+        // 16 ticks after the first accepted swing: still too soon.
+        advance(&mut sim, 15); // 16 ticks since the accepted swing in total
+        msg(&mut sim, id, epoch, ClientMessage::HitTile { x, y });
+        assert_eq!(sim.world().tile(x, y).id, TileId::Dirt);
+
+        // 17 ticks (= use time − 1, the tolerated jitter): accepted.
+        advance(&mut sim, 1);
+        msg(&mut sim, id, epoch, ClientMessage::HitTile { x, y });
+        assert_eq!(sim.world().tile(x, y).id, TileId::Air, "2nd swing landed");
+    }
+
+    #[test]
+    fn tile_damage_resets_after_five_seconds() {
+        let (mut sim, id, epoch, _rx) = setup();
+        let (x, y) = (55, FLOOR - 1);
+        set(&mut sim, x, y, TileId::Stone);
+        give(&mut sim, id, 0, ItemId::WoodPickaxe, 1);
+        swing_tile(&mut sim, id, epoch, x, y); // 25 points
+        advance(&mut sim, 310); // > 5 s without hits: decays
+        for _ in 0..3 {
+            swing_tile(&mut sim, id, epoch, x, y);
+        }
+        // 3 post-decay swings = 75 points: without the reset it would have
+        // broken on the 4th hit overall.
+        assert_eq!(sim.world().tile(x, y).id, TileId::Stone);
+        swing_tile(&mut sim, id, epoch, x, y);
+        assert_eq!(sim.world().tile(x, y).id, TileId::Air);
+    }
+
+    #[test]
+    fn reach_limits_swings_and_placement() {
+        let (mut sim, id, epoch, _rx) = setup();
+        give(&mut sim, id, 0, ItemId::EmberPickaxe, 1);
+        // Floor tile 20 columns away: out of the 6-tile reach.
+        let (x, y) = (70, FLOOR);
+        swing_tile(&mut sim, id, epoch, x, y);
+        assert_eq!(sim.world().tile(x, y).id, TileId::Stone);
+        give(&mut sim, id, 0, ItemId::Dirt, 10);
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::PlaceTile {
+                x,
+                y: FLOOR - 1,
+                hotbar_slot: 0,
+            },
+        );
+        assert_eq!(sim.world().tile(x, FLOOR - 1).id, TileId::Air);
+        assert_eq!(
+            sim.players[&id].inventory[0],
+            Some(InvSlot::new(ItemId::Dirt, 10)),
+            "out-of-reach placement consumes nothing"
+        );
+    }
+
+    #[test]
+    fn tree_felling_drops_per_segment_from_the_cut_upward() {
+        let (mut sim, id, epoch, _rx) = setup();
+        let x = 54; // wood drops stay out of auto-pickup range
+        // 5 trunk segments standing on the floor: rows 25..=29.
+        for i in 0..5u32 {
+            let y = FLOOR - 1 - i;
+            let mut t = sim.world().tile(x, y);
+            t.id = TileId::TreeTrunk;
+            t.state = if i == 4 {
+                state::TREE_SEGMENT_TOP
+            } else {
+                state::TREE_SEGMENT_TRUNK
+            };
+            sim.change_tile(x, y, t);
+        }
+        give(&mut sim, id, 0, ItemId::EmberAxe, 1); // 100 power: 1 swing/segment
+        // Cut the middle segment (row 27): it and the 2 above fall.
+        swing_tile(&mut sim, id, epoch, x, FLOOR - 3);
+        for y in [FLOOR - 3, FLOOR - 4, FLOOR - 5] {
+            assert_eq!(sim.world().tile(x, y).id, TileId::Air, "felled row {y}");
+        }
+        for y in [FLOOR - 1, FLOOR - 2] {
+            assert_eq!(sim.world().tile(x, y).id, TileId::TreeTrunk, "kept {y}");
+        }
+        assert_eq!(dropped(&sim, ItemId::Wood), 3 * WOOD_PER_TREE_SEGMENT as u32);
+        assert!(dropped(&sim, ItemId::Acorn) <= 3, "≤1 acorn per segment");
+
+        // Fell the stump: 2 more segments of wood.
+        swing_tile(&mut sim, id, epoch, x, FLOOR - 1);
+        assert_eq!(dropped(&sim, ItemId::Wood), 5 * WOOD_PER_TREE_SEGMENT as u32);
+    }
+
+    #[test]
+    fn pots_break_in_one_hit_from_anything_and_roll_loot() {
+        let (mut sim, id, epoch, _rx) = setup();
+        let (x, y) = (54, FLOOR - 1);
+        set(&mut sim, x, y, TileId::Pot);
+        give_nothing(&mut sim, id, 0); // bare hands qualify (ToolKind::Any)
+        swing_tile(&mut sim, id, epoch, x, y);
+        assert_eq!(sim.world().tile(x, y).id, TileId::Air);
+        let drops: Vec<(ItemId, u16)> = sim
+            .entities
+            .map
+            .values()
+            .map(|e| match e.kind {
+                EntityKind::ItemDrop { item, count } => (item, count),
+            })
+            .collect();
+        assert_eq!(drops.len(), 1);
+        let (item, count) = drops[0];
+        match item {
+            ItemId::SilverCoin => assert!((1..=10).contains(&count)),
+            ItemId::Torch => assert!((3..=8).contains(&count)),
+            ItemId::LesserHealingPotion => assert_eq!(count, 1),
+            ItemId::WoodenArrow => assert!((10..=20).contains(&count)),
+            ItemId::Gel => assert!((1..=4).contains(&count)),
+            other => panic!("{other:?} not in the §2.3 pot table"),
+        }
+    }
+
+    #[test]
+    fn chest_with_items_refuses_to_break() {
+        let (mut sim, id, epoch, _rx) = setup();
+        let (x, y) = (53, FLOOR - 2);
+        assert!(sim.world.place_multitile(x, y, TileId::Chest));
+        let mut slots = vec![None; ferraria_shared::world::CHEST_SLOTS];
+        slots[7] = Some(InvSlot::new(ItemId::Gel, 3));
+        sim.world.chests.insert((x, y), slots);
+
+        give(&mut sim, id, 0, ItemId::WoodPickaxe, 1);
+        // Hit a NON-origin cell: multi-tile resolution must still find it.
+        swing_tile(&mut sim, id, epoch, x + 1, y + 1);
+        assert_eq!(sim.world().tile(x, y).id, TileId::Chest, "refused");
+        assert!(sim.world.chests.contains_key(&(x, y)));
+
+        // Emptied: breaks as a unit and drops the chest item.
+        sim.world.chests.insert(
+            (x, y),
+            vec![None; ferraria_shared::world::CHEST_SLOTS],
+        );
+        swing_tile(&mut sim, id, epoch, x + 1, y);
+        for dy in 0..2 {
+            for dx in 0..2 {
+                assert_eq!(sim.world().tile(x + dx, y + dy).id, TileId::Air);
+            }
+        }
+        assert!(!sim.world.chests.contains_key(&(x, y)));
+        assert_eq!(dropped(&sim, ItemId::Chest), 1);
+    }
+
+    #[test]
+    fn placement_validation_suite() {
+        let (mut sim, id, epoch, mut rx) = setup();
+        give(&mut sim, id, 0, ItemId::Dirt, 50);
+        let place = |sim: &mut Sim, x: u32, y: u32| {
+            msg(
+                sim,
+                id,
+                epoch,
+                ClientMessage::PlaceTile {
+                    x,
+                    y,
+                    hotbar_slot: 0,
+                },
+            );
+        };
+
+        // No support: floating in mid-air with no wall/neighbor.
+        place(&mut sim, 53, FLOOR - 5);
+        assert_eq!(sim.world().tile(53, FLOOR - 5).id, TileId::Air);
+
+        // Inside-wall: the target cell is already occupied.
+        place(&mut sim, 53, FLOOR);
+        assert_eq!(sim.world().tile(53, FLOOR).id, TileId::Stone);
+
+        // Overlapping the player: solid placement refused.
+        let feet = (50, FLOOR - 1); // player center column, feet row
+        place(&mut sim, feet.0, feet.1);
+        assert_eq!(sim.world().tile(feet.0, feet.1).id, TileId::Air);
+
+        // Valid: on top of the floor, two tiles to the side.
+        assert_eq!(sim.players[&id].inventory[0].map(|s| s.count), Some(50));
+        drain(&mut rx);
+        place(&mut sim, 53, FLOOR - 1);
+        assert_eq!(sim.world().tile(53, FLOOR - 1).id, TileId::Dirt);
+        assert_eq!(sim.players[&id].inventory[0].map(|s| s.count), Some(49));
+        let msgs = drain(&mut rx);
+        assert!(msgs.iter().any(|m| matches!(m,
+            ServerMessage::TileChanged { x: 53, tile, .. } if tile.id == TileId::Dirt)));
+        assert!(msgs.iter().any(|m| matches!(m,
+            ServerMessage::SlotChanged { idx: 0, stack: Some(s) } if s.count == 49)));
+
+        // Door without a frame: needs solid above AND below.
+        give(&mut sim, id, 0, ItemId::Door, 5);
+        place(&mut sim, 47, FLOOR - 3); // top of a 1×3 ending on the floor
+        assert_eq!(
+            sim.world().tile(47, FLOOR - 3).id,
+            TileId::Air,
+            "no lintel above"
+        );
+        // Build the lintel and retry.
+        set(&mut sim, 47, FLOOR - 4, TileId::Stone);
+        place(&mut sim, 47, FLOOR - 3);
+        for dy in 0..3 {
+            let t = sim.world().tile(47, FLOOR - 3 + dy);
+            assert_eq!(t.id, TileId::Door);
+            assert_eq!(state::part_y(t.state) as u32, dy);
+        }
+
+        // Torch: not in water, needs a wall or adjacent solid.
+        give(&mut sim, id, 0, ItemId::Torch, 5);
+        place(&mut sim, 55, FLOOR - 5); // mid-air: no attach point
+        assert_eq!(sim.world().tile(55, FLOOR - 5).id, TileId::Air);
+        let mut wet = sim.world().tile(55, FLOOR - 1);
+        wet.liquid = Liquid::new(LiquidKind::Water, 4);
+        sim.change_tile(55, FLOOR - 1, wet);
+        place(&mut sim, 55, FLOOR - 1); // on the floor but submerged
+        assert_eq!(sim.world().tile(55, FLOOR - 1).id, TileId::Air);
+        place(&mut sim, 54, FLOOR - 1); // dry, floor below: ok
+        assert_eq!(sim.world().tile(54, FLOOR - 1).id, TileId::Torch);
+
+        // Furniture floor rule: a workbench can't hang in the air.
+        give(&mut sim, id, 0, ItemId::Workbench, 2);
+        place(&mut sim, 49, FLOOR - 4);
+        assert_eq!(sim.world().tile(49, FLOOR - 4).id, TileId::Air);
+        place(&mut sim, 51, FLOOR - 1);
+        assert_eq!(sim.world().tile(51, FLOOR - 1).id, TileId::Workbench);
+        assert_eq!(sim.world().tile(52, FLOOR - 1).id, TileId::Workbench);
+    }
+
+    #[test]
+    fn placed_walls_drop_natural_walls_do_not() {
+        let (mut sim, id, epoch, _rx) = setup();
+        give(&mut sim, id, 0, ItemId::WoodWall, 5);
+        let (x, y) = (54, FLOOR - 1); // wall against the floor: supported
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::PlaceWall {
+                x,
+                y,
+                hotbar_slot: 0,
+            },
+        );
+        let t = sim.world().tile(x, y);
+        assert_eq!(t.wall, WallId::Wood);
+        assert_ne!(t.state & state::WALL_PLACED, 0);
+        assert_eq!(sim.players[&id].inventory[0].map(|s| s.count), Some(4));
+
+        // Floating wall placement is refused.
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::PlaceWall {
+                x: 55,
+                y: FLOOR - 6,
+                hotbar_slot: 0,
+            },
+        );
+        assert_eq!(sim.world().tile(55, FLOOR - 6).wall, WallId::Air);
+
+        // Hammering the placed wall drops it (one swing: 55 × 2.0 = 110).
+        give(&mut sim, id, 0, ItemId::IronHammer, 1);
+        msg(&mut sim, id, epoch, ClientMessage::HitWall { x, y });
+        advance(&mut sim, 40);
+        assert_eq!(sim.world().tile(x, y).wall, WallId::Air);
+        assert_eq!(dropped(&sim, ItemId::WoodWall), 1);
+
+        // A natural wall (no WALL_PLACED bit) breaks but drops nothing.
+        let mut nat = sim.world().tile(x, y);
+        nat.wall = WallId::Dirt;
+        nat.state &= !state::WALL_PLACED;
+        sim.change_tile(x, y, nat);
+        msg(&mut sim, id, epoch, ClientMessage::HitWall { x, y });
+        advance(&mut sim, 40);
+        assert_eq!(sim.world().tile(x, y).wall, WallId::Air);
+        assert_eq!(dropped(&sim, ItemId::DirtWall), 0);
+    }
+
+    #[test]
+    fn doors_toggle_away_from_the_player_and_refuse_blocked_closes() {
+        let (mut sim, id, epoch, _rx) = setup();
+        // Door frame at column 53, rows 27..=29, lintel at 26.
+        let x = 53;
+        set(&mut sim, x, FLOOR - 4, TileId::Stone);
+        give(&mut sim, id, 0, ItemId::Door, 1);
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::PlaceTile {
+                x,
+                y: FLOOR - 3,
+                hotbar_slot: 0,
+            },
+        );
+        assert_eq!(sim.world().tile(x, FLOOR - 1).id, TileId::Door);
+        assert!(sim.world().tile(x, FLOOR - 1).is_solid(), "closed = solid");
+
+        // Player stands left of the door: panel opens right (away).
+        place_player(&mut sim, id, 50.0, FLOOR as f32);
+        msg(&mut sim, id, epoch, ClientMessage::ToggleDoor { x, y: FLOOR - 2 });
+        for dy in 1..=3 {
+            let t = sim.world().tile(x, FLOOR - dy);
+            assert_ne!(t.state & state::DOOR_OPEN, 0, "open row {dy}");
+            assert_eq!(t.state & state::DOOR_OPEN_LEFT, 0, "panel right");
+            assert!(!t.is_solid(), "open = passable");
+        }
+
+        // A player standing in the doorway blocks closing.
+        place_player(&mut sim, id, x as f32 + 0.5, FLOOR as f32);
+        msg(&mut sim, id, epoch, ClientMessage::ToggleDoor { x, y: FLOOR - 1 });
+        assert_ne!(
+            sim.world().tile(x, FLOOR - 1).state & state::DOOR_OPEN,
+            0,
+            "refused to close on an occupant"
+        );
+
+        // Step aside: closes (and the panel-side bit clears).
+        place_player(&mut sim, id, 56.0, FLOOR as f32);
+        msg(&mut sim, id, epoch, ClientMessage::ToggleDoor { x, y: FLOOR - 1 });
+        let t = sim.world().tile(x, FLOOR - 1);
+        assert_eq!(t.state & (state::DOOR_OPEN | state::DOOR_OPEN_LEFT), 0);
+        assert!(t.is_solid());
+
+        // Player now right of the door: panel opens left.
+        msg(&mut sim, id, epoch, ClientMessage::ToggleDoor { x, y: FLOOR - 1 });
+        assert_ne!(
+            sim.world().tile(x, FLOOR - 1).state & state::DOOR_OPEN_LEFT,
+            0
+        );
+    }
+
+    #[test]
+    fn acorns_plant_saplings_on_grass_only() {
+        let (mut sim, id, epoch, _rx) = setup();
+        give(&mut sim, id, 0, ItemId::Acorn, 2);
+        let (x, y) = (52, FLOOR - 1);
+        // On stone: refused.
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::PlaceTile {
+                x,
+                y,
+                hotbar_slot: 0,
+            },
+        );
+        assert_eq!(sim.world().tile(x, y).id, TileId::Air);
+        // On grass: planted and scheduled to grow.
+        set(&mut sim, x, FLOOR, TileId::Grass);
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::PlaceTile {
+                x,
+                y,
+                hotbar_slot: 0,
+            },
+        );
+        assert_eq!(sim.world().tile(x, y).id, TileId::Sapling);
+        let due = sim.saplings.get(&(x, y)).copied().expect("scheduled");
+        let min = (SAPLING_GROW_MIN_SECS * TICK_RATE as f32) as u64;
+        let max = (SAPLING_GROW_MAX_SECS * TICK_RATE as f32) as u64;
+        assert!((min..=max).contains(&due.saturating_sub(sim.tick)), "due {due}");
+    }
+}

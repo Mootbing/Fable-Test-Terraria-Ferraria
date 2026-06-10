@@ -302,3 +302,221 @@ fn is_puddle(world: &ferraria_shared::world::World, x: u32, y: u32) -> bool {
     let t = world.tile(x, y);
     t.liquid.is_some() && t.liquid.level() == 1 && world.is_solid(x as i32, y as i32 + 1)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_util::*;
+    use super::*;
+    use ferraria_shared::protocol::ServerMessage;
+    use ferraria_shared::tiles::Tile;
+
+    const FLOOR: u32 = 30;
+
+    fn set_tile(sim: &mut super::super::game::Sim, x: u32, y: u32, id: TileId) {
+        let mut t = sim.world().tile(x, y);
+        t.id = id;
+        sim.change_tile(x, y, t);
+    }
+
+    #[test]
+    fn fluids_step_on_cadence_and_broadcast_batches() {
+        let mut sim = flat_sim(100, 60, FLOOR);
+        let (_id, _epoch, mut rx) = join(&mut sim, "alice");
+        drain(&mut rx);
+        // A 1-wide stone cup on the floor keeps the water from spreading.
+        let (x, y) = (52, FLOOR - 3);
+        set_tile(&mut sim, x - 1, FLOOR - 1, TileId::Stone);
+        set_tile(&mut sim, x + 1, FLOOR - 1, TileId::Stone);
+        // A full water cell two above the cup: it must flow down.
+        let mut t = Tile::AIR;
+        t.liquid = Liquid::new(LiquidKind::Water, 8);
+        sim.change_tile(x, y, t);
+        drain(&mut rx);
+
+        // Tick 1 is off-cadence for water (every 2 ticks): nothing moves.
+        advance(&mut sim, 1);
+        assert!(
+            !drain(&mut rx)
+                .iter()
+                .any(|m| matches!(m, ServerMessage::TilesChanged { .. })),
+            "no fluid batch off-cadence"
+        );
+        assert_eq!(sim.world().tile(x, y).liquid.level(), 8);
+
+        // Tick 2: the water falls one cell, batched as TilesChanged.
+        advance(&mut sim, 1);
+        let msgs = drain(&mut rx);
+        let batch = msgs
+            .iter()
+            .find_map(|m| match m {
+                ServerMessage::TilesChanged { changes } => Some(changes.clone()),
+                _ => None,
+            })
+            .expect("fluid batch broadcast");
+        assert!(batch.iter().any(|&(bx, by, t)| (bx, by) == (x, y + 1)
+            && t.liquid.kind() == Some(LiquidKind::Water)));
+        assert_eq!(sim.world().tile(x, y).liquid.level(), 0);
+        assert_eq!(sim.world().tile(x, y + 1).liquid.level(), 8);
+
+        // Settles on the floor and goes quiet.
+        advance(&mut sim, 10);
+        assert_eq!(sim.world().tile(x, FLOOR - 1).liquid.level(), 8);
+        drain(&mut rx);
+        advance(&mut sim, 10);
+        assert!(
+            !drain(&mut rx)
+                .iter()
+                .any(|m| matches!(m, ServerMessage::TilesChanged { .. })),
+            "settled water stops broadcasting"
+        );
+    }
+
+    #[test]
+    fn sand_columns_collapse_one_cell_per_tick() {
+        let mut sim = flat_sim(100, 60, FLOOR);
+        let (_id, _epoch, mut rx) = join(&mut sim, "alice");
+        drain(&mut rx);
+        // A stone shelf 3 cells above the floor holds a 3-sand column.
+        let x = 52;
+        let shelf = FLOOR - 3;
+        set_tile(&mut sim, x, shelf, TileId::Stone);
+        for dy in 1..=3 {
+            set_tile(&mut sim, x, shelf - dy, TileId::Sand);
+        }
+        drain(&mut rx);
+        // Knock out the shelf: the column descends 1 cell per tick, moving
+        // as a unit, until it rests on the floor.
+        set_tile(&mut sim, x, shelf, TileId::Air);
+
+        advance(&mut sim, 1);
+        assert_eq!(sim.world().tile(x, shelf).id, TileId::Sand, "fell 1");
+        assert_eq!(sim.world().tile(x, shelf - 1).id, TileId::Sand);
+        assert_eq!(sim.world().tile(x, shelf - 3).id, TileId::Air, "top vacated");
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|m| matches!(m, ServerMessage::TilesChanged { .. })),
+            "sand movement batches"
+        );
+
+        advance(&mut sim, 1);
+        assert_eq!(sim.world().tile(x, shelf + 1).id, TileId::Sand, "fell 2");
+
+        advance(&mut sim, 6);
+        // Settled: 3 sand resting on the floor, nothing floating above.
+        for dy in 1..=3 {
+            assert_eq!(sim.world().tile(x, FLOOR - dy).id, TileId::Sand);
+        }
+        assert_eq!(sim.world().tile(x, FLOOR - 4).id, TileId::Air);
+        let total = (0..FLOOR)
+            .filter(|&y| sim.world().tile(x, y).id == TileId::Sand)
+            .count();
+        assert_eq!(total, 3, "sand conserved");
+    }
+
+    #[test]
+    fn sand_sinks_through_water_displacing_it() {
+        let mut sim = flat_sim(100, 60, FLOOR);
+        let x = 52;
+        // Water resting on the floor with sand floating right above it.
+        let mut w = Tile::AIR;
+        w.liquid = Liquid::new(LiquidKind::Water, 8);
+        sim.change_tile(x, FLOOR - 1, w);
+        set_tile(&mut sim, x, FLOOR - 2, TileId::Sand);
+
+        advance(&mut sim, 1);
+        assert_eq!(sim.world().tile(x, FLOOR - 1).id, TileId::Sand, "sank");
+        assert_eq!(
+            sim.world().tile(x, FLOOR - 1).liquid.level(),
+            0,
+            "solid cell holds no liquid"
+        );
+        assert_eq!(
+            sim.world().tile(x, FLOOR - 2).liquid.level(),
+            8,
+            "water displaced upward"
+        );
+    }
+
+    #[test]
+    fn grass_spreads_and_dies_by_random_tick() {
+        let mut sim = flat_sim(100, 60, FLOOR);
+        // Grass next to exposed dirt: a tile update converts the dirt.
+        let x = 52;
+        set_tile(&mut sim, x, FLOOR, TileId::Grass);
+        set_tile(&mut sim, x + 1, FLOOR, TileId::Dirt);
+        sim.random_tick_cell(x, FLOOR);
+        assert_eq!(sim.world().tile(x + 1, FLOOR).id, TileId::Grass, "spread");
+
+        // Covered grass (all four neighbors solid) dies to dirt.
+        let (cx, cy) = (60, FLOOR + 2); // inside the floor slab
+        set_tile(&mut sim, cx, cy, TileId::Grass);
+        sim.random_tick_cell(cx, cy);
+        assert_eq!(sim.world().tile(cx, cy).id, TileId::Dirt, "died covered");
+    }
+
+    #[test]
+    fn torches_extinguish_under_water() {
+        let mut sim = flat_sim(100, 60, FLOOR);
+        let (x, y) = (52, FLOOR - 1);
+        let mut t = Tile::of(TileId::Torch);
+        t.liquid = Liquid::new(LiquidKind::Water, 4);
+        sim.change_tile(x, y, t);
+        sim.random_tick_cell(x, y);
+        assert_eq!(sim.world().tile(x, y).id, TileId::Air, "snuffed out");
+        // The torch pops out as a drop.
+        assert_eq!(sim.entities.map.len(), 1);
+    }
+
+    #[test]
+    fn saplings_grow_into_trees_when_unblocked() {
+        let mut sim = flat_sim(100, 60, FLOOR);
+        let x = 52;
+        set_tile(&mut sim, x, FLOOR, TileId::Grass);
+        set_tile(&mut sim, x, FLOOR - 1, TileId::Sapling);
+        sim.saplings.insert((x, FLOOR - 1), 0); // due immediately
+
+        // Blocked: a ceiling 3 tiles up leaves < 7 air above.
+        set_tile(&mut sim, x, FLOOR - 4, TileId::Stone);
+        advance(&mut sim, 61);
+        assert_eq!(sim.world().tile(x, FLOOR - 1).id, TileId::Sapling);
+        assert!(sim.saplings.contains_key(&(x, FLOOR - 1)), "retries later");
+
+        // Unblock: it grows into a 7–16 segment tree with a crown.
+        set_tile(&mut sim, x, FLOOR - 4, TileId::Air);
+        advance(&mut sim, 61);
+        assert!(!sim.saplings.contains_key(&(x, FLOOR - 1)));
+        let mut height = 0;
+        while sim.world().tile(x, FLOOR - 1 - height).id == TileId::TreeTrunk {
+            height += 1;
+        }
+        assert!(
+            (TREE_HEIGHT_MIN..=TREE_HEIGHT_MAX).contains(&height),
+            "tree height {height}"
+        );
+        let top = sim.world().tile(x, FLOOR - height);
+        assert_eq!(
+            top.state & 0x7,
+            ferraria_shared::tiles::state::TREE_SEGMENT_TOP
+        );
+    }
+
+    #[test]
+    fn level_one_puddles_evaporate_after_a_minute() {
+        let mut sim = flat_sim(100, 60, FLOOR);
+        let (x, y) = (52, FLOOR - 1);
+        let mut t = Tile::AIR;
+        t.liquid = Liquid::new(LiquidKind::Water, 1);
+        sim.change_tile(x, y, t);
+        assert!(sim.puddles.contains_key(&(x, y)), "tracked on change");
+
+        // 59 s: still wet. (The fluid automaton leaves a stable level-1
+        // puddle alone.)
+        advance(&mut sim, 59 * 60);
+        assert_eq!(sim.world().tile(x, y).liquid.level(), 1);
+        // Past 60 s (plus the once-a-second sweep): gone.
+        advance(&mut sim, 2 * 60);
+        assert_eq!(sim.world().tile(x, y).liquid.level(), 0);
+        assert!(!sim.puddles.contains_key(&(x, y)));
+    }
+}

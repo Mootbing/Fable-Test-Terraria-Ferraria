@@ -382,3 +382,244 @@ fn touches_liquid(world: &ferraria_shared::world::World, e: &Entity, kind: Liqui
     }
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_util::*;
+    use super::*;
+    use ferraria_shared::items::{inventory, InvSlot};
+    use ferraria_shared::tiles::{Liquid, Tile, TileId};
+
+    const FLOOR: u32 = 30;
+
+    #[test]
+    fn drops_fall_arm_and_get_picked_up() {
+        let mut sim = flat_sim(100, 60, FLOOR);
+        let (id, _epoch, mut rx) = join(&mut sim, "alice");
+        drain(&mut rx);
+        place_player(&mut sim, id, 50.0, FLOOR as f32);
+        // Empty the starting kit so the pickup lands in slot 0.
+        sim.players.get_mut(&id).expect("p").inventory = vec![None; inventory::TOTAL];
+
+        let eid = sim.spawn_item_drop_exact(
+            ItemId::Gel,
+            3,
+            (50.5, FLOOR as f32 - 3.0),
+            (0.0, 0.0),
+            sim.tick,
+        );
+        // Spawn announced to the subscribed player.
+        assert!(drain(&mut rx).iter().any(|m| matches!(m,
+            ServerMessage::ItemDropSpawn { id, item: ItemId::Gel, count: 3, .. } if *id == eid)));
+
+        // Within the arming window nothing is collected, even though the
+        // drop lands right at the player's feet.
+        advance(&mut sim, 20);
+        assert!(sim.entities.map.contains_key(&eid), "still armed");
+        // Falling drops are snapshot in EntityUpdate batches.
+        assert!(drain(&mut rx).iter().any(|m| matches!(m,
+            ServerMessage::EntityUpdate { entities } if entities.iter().any(|e| e.id == eid))));
+
+        // Once armed (0.5 s), the nearby player auto-collects.
+        advance(&mut sim, 15);
+        assert!(!sim.entities.map.contains_key(&eid));
+        assert_eq!(
+            sim.players[&id].inventory[0],
+            Some(InvSlot::new(ItemId::Gel, 3))
+        );
+        let msgs = drain(&mut rx);
+        assert!(msgs.iter().any(|m| matches!(m,
+            ServerMessage::ItemPickedUp { id, by } if *id == eid && *by == sim_player(&sim))));
+        assert!(msgs.iter().any(|m| matches!(m,
+            ServerMessage::SlotChanged { idx: 0, stack: Some(s) }
+                if s.item == ItemId::Gel && s.count == 3)));
+    }
+
+    /// The single player id in a one-player test sim.
+    fn sim_player(sim: &super::super::game::Sim) -> u32 {
+        *sim.players.keys().next().expect("one player")
+    }
+
+    #[test]
+    fn full_inventories_leave_drops_on_the_ground() {
+        let mut sim = flat_sim(100, 60, FLOOR);
+        let (id, _epoch, mut rx) = join(&mut sim, "alice");
+        drain(&mut rx);
+        place_player(&mut sim, id, 50.0, FLOOR as f32);
+        // Stuff every carry slot with un-mergeable fulls.
+        {
+            let p = sim.players.get_mut(&id).expect("p");
+            for i in 0..inventory::ARMOR_START {
+                p.inventory[i] = Some(InvSlot::new(ItemId::Stone, 999));
+            }
+        }
+        let eid = sim.spawn_item_drop_exact(
+            ItemId::Gel,
+            5,
+            (50.5, FLOOR as f32 - 1.0),
+            (0.0, 0.0),
+            sim.tick,
+        );
+        advance(&mut sim, 60);
+        assert!(sim.entities.map.contains_key(&eid), "no room: stays");
+
+        // Partial room: 997 stone fit into one stack of 999.
+        sim.players.get_mut(&id).expect("p").inventory[0] = Some(InvSlot::new(ItemId::Stone, 997));
+        let sid = sim.spawn_item_drop_exact(
+            ItemId::Stone,
+            5,
+            (50.5, FLOOR as f32 - 1.0),
+            (0.0, 0.0),
+            sim.tick.saturating_sub(60), // already armed
+        );
+        advance(&mut sim, 2);
+        assert!(!sim.entities.map.contains_key(&sid), "original picked up");
+        assert_eq!(
+            sim.players[&id].inventory[0],
+            Some(InvSlot::new(ItemId::Stone, 999))
+        );
+        // The 3 leftovers re-spawned as a fresh drop.
+        let leftover: u32 = sim
+            .entities
+            .map
+            .values()
+            .map(|e| match e.kind {
+                EntityKind::ItemDrop { item: ItemId::Stone, count } => count as u32,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(leftover, 3);
+        drain(&mut rx);
+    }
+
+    #[test]
+    fn nearby_same_item_drops_merge() {
+        let mut sim = flat_sim(100, 60, FLOOR);
+        let a = sim.spawn_item_drop_exact(
+            ItemId::Wood,
+            10,
+            (60.5, FLOOR as f32 - 0.5),
+            (0.0, 0.0),
+            0,
+        );
+        let b = sim.spawn_item_drop_exact(
+            ItemId::Wood,
+            7,
+            (61.0, FLOOR as f32 - 0.5),
+            (0.0, 0.0),
+            0,
+        );
+        // Different item nearby must not merge in.
+        let c = sim.spawn_item_drop_exact(
+            ItemId::Gel,
+            1,
+            (60.7, FLOOR as f32 - 0.5),
+            (0.0, 0.0),
+            0,
+        );
+        advance(&mut sim, 3);
+        assert!(!sim.entities.map.contains_key(&a));
+        assert!(!sim.entities.map.contains_key(&b));
+        assert!(sim.entities.map.contains_key(&c));
+        let wood: Vec<u16> = sim
+            .entities
+            .map
+            .values()
+            .filter_map(|e| match e.kind {
+                EntityKind::ItemDrop { item: ItemId::Wood, count } => Some(count),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(wood, vec![17], "one merged stack");
+    }
+
+    #[test]
+    fn lava_destroys_drops_except_the_immune_tier() {
+        let mut sim = flat_sim(100, 60, FLOOR);
+        // A lava pool cell just above the floor.
+        let (x, y) = (60, FLOOR - 1);
+        let mut t = Tile::of(TileId::Air);
+        t.liquid = Liquid::new(ferraria_shared::tiles::LiquidKind::Lava, 8);
+        sim.change_tile(x, y, t);
+
+        let wood = sim.spawn_item_drop_exact(
+            ItemId::Wood,
+            5,
+            (x as f32 + 0.5, y as f32 + 0.5),
+            (0.0, 0.0),
+            sim.tick,
+        );
+        let obsidian = sim.spawn_item_drop_exact(
+            ItemId::Obsidian,
+            5,
+            (x as f32 + 0.5, y as f32 + 0.5),
+            (0.0, 0.0),
+            sim.tick,
+        );
+        advance(&mut sim, 2);
+        assert!(!sim.entities.map.contains_key(&wood), "wood burned");
+        assert!(sim.entities.map.contains_key(&obsidian), "obsidian floats");
+    }
+
+    #[test]
+    fn drops_despawn_after_ten_minutes() {
+        let mut sim = flat_sim(100, 60, FLOOR);
+        let eid = sim.spawn_item_drop_exact(
+            ItemId::Wood,
+            1,
+            (60.5, FLOOR as f32 - 0.5),
+            (0.0, 0.0),
+            0,
+        );
+        sim.tick = (ITEM_DESPAWN_SECS * TICK_RATE as f32) as u64 - 2;
+        advance(&mut sim, 1);
+        assert!(sim.entities.map.contains_key(&eid), "one tick early");
+        advance(&mut sim, 1);
+        assert!(!sim.entities.map.contains_key(&eid), "gone at 10 min");
+    }
+
+    #[test]
+    fn updates_are_filtered_by_chunk_window_and_spawns_replay_on_subscribe() {
+        let mut sim = flat_sim(300, 100, 80);
+        let (_id, _epoch, mut rx) = join(&mut sim, "alice");
+        drain(&mut rx);
+        // A drop inside alice's chunk window gets snapshot batches, and
+        // `spawn_messages_in_chunk` replays it for late subscribers.
+        let inside = sim.spawn_item_drop_exact(ItemId::Gel, 1, (150.5, 70.0), (0.0, 0.0), 0);
+        advance(&mut sim, 3);
+        assert!(drain(&mut rx).iter().any(|m| matches!(m,
+            ServerMessage::EntityUpdate { entities } if entities.iter().any(|e| e.id == inside))));
+
+        let replay = sim
+            .entities
+            .spawn_messages_in_chunk(((150 / 64), (70 / 64)));
+        assert!(replay.iter().any(|m| matches!(m,
+            ServerMessage::ItemDropSpawn { id, .. } if *id == inside)));
+        assert!(sim
+            .entities
+            .spawn_messages_in_chunk((0, 0))
+            .is_empty());
+    }
+
+    #[test]
+    fn aabb_distance_is_zero_inside_and_euclidean_outside() {
+        let pos = (10.0, 10.0);
+        let size = (2.0, 2.0);
+        assert_eq!(aabb_point_distance(pos, size, (11.0, 11.0)), 0.0);
+        assert_eq!(aabb_point_distance(pos, size, (13.0, 11.0)), 1.0);
+        let d = aabb_point_distance(pos, size, (13.0, 13.0));
+        assert!((d - std::f32::consts::SQRT_2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn merged_drops_keep_the_oldest_spawn_tick() {
+        let mut sim = flat_sim(100, 60, FLOOR);
+        sim.tick = 1000;
+        sim.spawn_item_drop_exact(ItemId::Wood, 1, (60.5, FLOOR as f32 - 0.5), (0.0, 0.0), 100);
+        sim.spawn_item_drop_exact(ItemId::Wood, 1, (61.0, FLOOR as f32 - 0.5), (0.0, 0.0), 900);
+        advance(&mut sim, 2);
+        let survivor = sim.entities.map.values().next().expect("merged survivor");
+        assert_eq!(sim.entities.map.len(), 1);
+        assert_eq!(survivor.spawn_tick, 100, "despawn timer not reset");
+    }
+}

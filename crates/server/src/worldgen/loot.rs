@@ -223,9 +223,9 @@ mod tests {
         assert_eq!(pot_coin_mult(999, 1200), 2);
         assert_eq!(pot_coin_mult(1000, 1200), 4);
         assert_eq!(pot_coin_mult(1199, 1200), 4);
-        // Scaled world (300 rows): bands at 112/113 and 250.
-        assert_eq!(pot_coin_mult(112, 300), 1);
-        assert_eq!(pot_coin_mult(113, 300), 2);
+        // Scaled world (300 rows): bands start at row 112 (450/4) and 250.
+        assert_eq!(pot_coin_mult(111, 300), 1);
+        assert_eq!(pot_coin_mult(112, 300), 2);
         assert_eq!(pot_coin_mult(250, 300), 4);
     }
 
