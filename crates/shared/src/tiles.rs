@@ -405,6 +405,12 @@ pub mod state {
     pub const TREE_SEGMENT_TRUNK: u8 = 0;
     pub const TREE_SEGMENT_TOP: u8 = 1;
 
+    /// Sprite-variant (bits 0–2) on a `Grass` tile: a mushroom forage plant
+    /// grows here (DESIGN §1.2 pass 9 — the 35-tile table has no mushroom
+    /// tile, so forage plants live on the grass cell; foraging yields
+    /// `ItemId::Mushroom` and clears the variant, handled server-side).
+    pub const GRASS_MUSHROOM: u8 = 1;
+
     /// Packs a multi-tile part offset. `dx` 0–7, `dy` 0–3.
     #[inline]
     pub const fn part(dx: u8, dy: u8) -> u8 {

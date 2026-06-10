@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::items::InvSlot;
-use crate::tiles::{Liquid, Tile, TileId};
+use crate::tiles::{state, Liquid, Tile, TileId};
 
 /// Default world size (§0).
 pub const WORLD_WIDTH: u32 = 4200;
@@ -153,6 +153,46 @@ impl World {
 
     pub fn is_day(&self) -> bool {
         is_day(self.time)
+    }
+
+    /// Places a multi-tile object (furniture etc.) with its origin (top-left)
+    /// at `(x, y)`, using the footprint from `TILE_DATA[id].size`. Every
+    /// covered cell gets `id` with its frame byte set to
+    /// [`state::part`]`(dx, dy)` so all parts agree on the object's layout;
+    /// walls and liquid in the cells are preserved.
+    ///
+    /// Returns `false` (changing nothing) unless the whole footprint is in
+    /// bounds and empty of foreground tiles. Callers enforce furniture-
+    /// specific support rules (floor below, attach points, ...).
+    pub fn place_multitile(&mut self, x: u32, y: u32, id: TileId) -> bool {
+        let (w, h) = id.data().size;
+        let (w, h) = (w as u32, h as u32);
+        for dy in 0..h {
+            for dx in 0..w {
+                if !self.in_bounds(x + dx, y + dy) || !self.is_empty(x + dx, y + dy) {
+                    return false;
+                }
+            }
+        }
+        for dy in 0..h {
+            for dx in 0..w {
+                let mut t = self.tile(x + dx, y + dy);
+                t.id = id;
+                t.state = state::part(dx as u8, dy as u8);
+                self.set_tile(x + dx, y + dy, t);
+            }
+        }
+        true
+    }
+
+    /// Origin (top-left) of the multi-tile object covering `(x, y)`, derived
+    /// from the cell's frame byte. Returns `(x, y)` itself for 1×1 tiles.
+    pub fn multitile_origin(&self, x: u32, y: u32) -> (u32, u32) {
+        let t = self.tile(x, y);
+        (
+            x.saturating_sub(state::part_x(t.state) as u32),
+            y.saturating_sub(state::part_y(t.state) as u32),
+        )
     }
 
     /// Chunk-grid dimensions (edge chunks may hang past the world edge and
@@ -311,6 +351,35 @@ mod tests {
         raw[0] = 250; // invalid tile id
         let bad = lz4_flex::compress_prepend_size(&raw);
         assert_eq!(decode_chunk(&bad), Err(ChunkDecodeError::InvalidTile));
+    }
+
+    #[test]
+    fn place_multitile_sets_part_frames() {
+        let mut w = World::new(32, 32);
+        // Bed is 4×2.
+        assert!(w.place_multitile(10, 10, TileId::Bed));
+        for dy in 0..2u32 {
+            for dx in 0..4u32 {
+                let t = w.tile(10 + dx, 10 + dy);
+                assert_eq!(t.id, TileId::Bed);
+                assert_eq!(state::part_x(t.state) as u32, dx);
+                assert_eq!(state::part_y(t.state) as u32, dy);
+                assert_eq!(w.multitile_origin(10 + dx, 10 + dy), (10, 10));
+            }
+        }
+        // Overlap and out-of-bounds placements are rejected atomically.
+        assert!(!w.place_multitile(12, 10, TileId::Chest));
+        assert!(!w.place_multitile(31, 30, TileId::Chest)); // x+1 out of bounds
+        assert_eq!(w.tile(31, 30), Tile::AIR);
+        assert_eq!(w.tile(31, 31), Tile::AIR);
+        // Walls and liquid survive placement.
+        let mut cell = Tile::AIR;
+        cell.wall = WallId::Stone;
+        cell.liquid = Liquid::new(LiquidKind::Water, 4);
+        w.set_tile(20, 20, cell);
+        assert!(w.place_multitile(20, 20, TileId::Torch));
+        assert_eq!(w.tile(20, 20).wall, WallId::Stone);
+        assert_eq!(w.tile(20, 20).liquid, Liquid::new(LiquidKind::Water, 4));
     }
 
     #[test]
