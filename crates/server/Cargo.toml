@@ -14,3 +14,7 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+# PNG output for the `worldgen_preview` dev binary only (server-only dep;
+# pinned to the 0.24 line macroquad already pulls so the tree keeps a single
+# `image` version).
+image = { version = "0.24", default-features = false, features = ["png"] }
