@@ -259,14 +259,14 @@ fn consume(slots: &mut [Option<InvSlot>], item: ItemId, count: u16) {
 }
 
 /// Adds `count` of `item`, stacking onto existing stacks first, then into
-/// empty slots. Returns `false` (leaving `slots` modified!) if it doesn't
-/// fit — callers use [`apply_craft`], which stays transactional.
-fn insert(slots: &mut [Option<InvSlot>], item: ItemId, count: u16) -> bool {
+/// empty slots. Returns the count that did not fit (0 = everything placed;
+/// `slots` is left modified either way — callers handle transactionality).
+fn insert(slots: &mut [Option<InvSlot>], item: ItemId, count: u16) -> u16 {
     let max = item.max_stack();
     let mut left = count;
     for slot in slots.iter_mut() {
         if left == 0 {
-            return true;
+            return 0;
         }
         if let Some(s) = slot {
             if s.item == item && s.count < max {
@@ -278,7 +278,7 @@ fn insert(slots: &mut [Option<InvSlot>], item: ItemId, count: u16) -> bool {
     }
     for slot in slots.iter_mut() {
         if left == 0 {
-            return true;
+            return 0;
         }
         if slot.is_none() {
             let add = max.min(left);
@@ -286,25 +286,40 @@ fn insert(slots: &mut [Option<InvSlot>], item: ItemId, count: u16) -> bool {
             left -= add;
         }
     }
-    left == 0
+    left
 }
 
 /// Crafts `recipe` against `slots`: consumes inputs and inserts the output.
 /// Transactional — on `false` (missing ingredients or no room for the
 /// output) `slots` is unchanged. The station check is the caller's job.
 pub fn apply_craft(recipe: &Recipe, slots: &mut [Option<InvSlot>]) -> bool {
+    matches!(apply_craft_overflow(recipe, slots, false), Some(0))
+}
+
+/// Like [`apply_craft`], but with `allow_overflow` the craft succeeds even
+/// when the output doesn't fully fit: inputs are consumed, what fits is
+/// inserted, and the overflow count is returned for the caller to drop on
+/// the ground (§4.4 crafting always yields its output). Returns `None`
+/// (slots unchanged) when ingredients are missing — or when overflow is
+/// disallowed and the output has no room.
+pub fn apply_craft_overflow(
+    recipe: &Recipe,
+    slots: &mut [Option<InvSlot>],
+    allow_overflow: bool,
+) -> Option<u16> {
     if !can_craft(recipe, slots) {
-        return false;
+        return None;
     }
     let mut work = slots.to_vec();
     for &(item, need) in recipe.inputs {
         consume(&mut work, item, need);
     }
-    if !insert(&mut work, recipe.output, recipe.count) {
-        return false;
+    let overflow = insert(&mut work, recipe.output, recipe.count);
+    if overflow > 0 && !allow_overflow {
+        return None;
     }
     slots.copy_from_slice(&work);
-    true
+    Some(overflow)
 }
 
 #[cfg(test)]
@@ -421,6 +436,24 @@ mod tests {
         ];
         assert!(apply_craft(arrows, &mut slots));
         assert_eq!(count_item(&slots, I::WoodenArrow), 25);
+    }
+
+    #[test]
+    fn craft_overflow_consumes_and_reports_the_excess() {
+        // 25 arrows out, but only 990..999 fits onto the existing stack.
+        let arrows = recipe_by_id(45).expect("arrows");
+        let mut slots = vec![
+            Some(InvSlot::new(I::Wood, 2)),
+            Some(InvSlot::new(I::Stone, 2)),
+            Some(InvSlot::new(I::WoodenArrow, 990)),
+        ];
+        let over = apply_craft_overflow(arrows, &mut slots, true).expect("crafts");
+        assert_eq!(over, 16, "9 fit on the stack, 16 overflow");
+        assert_eq!(count_item(&slots, I::WoodenArrow), 999);
+        assert_eq!(count_item(&slots, I::Wood), 1);
+        // Missing inputs still fail without touching anything.
+        let mut empty: Vec<Option<InvSlot>> = vec![None; 5];
+        assert_eq!(apply_craft_overflow(arrows, &mut empty, true), None);
     }
 
     #[test]
