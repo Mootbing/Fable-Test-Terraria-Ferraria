@@ -125,9 +125,8 @@ impl Sim {
             };
             if tool.is_some_and(|t| t.kind == ToolKind::Hammer) {
                 let hp = self.players.get(&id).map(|p| p.hp).unwrap_or(0);
-                let backlash = (hp as f32
-                    * ferraria_shared::tiles::RITUAL_ALTAR_BACKLASH_HP_FRACTION)
-                    as u32;
+                let backlash =
+                    (hp as f32 * ferraria_shared::tiles::RITUAL_ALTAR_BACKLASH_HP_FRACTION) as u32;
                 if backlash > 0 {
                     self.hurt_player(id, backlash, super::survival::Hurt::Raw);
                 }

@@ -427,7 +427,16 @@ impl Sim {
                 self.next_player_id += 1;
                 let pos = spawn_pos(&self.world);
                 let base = ferraria_shared::PLAYER_BASE_MAX_HP as u16;
-                (id, self.fresh_token(), pos, 0, starting_inventory(), base, base, None)
+                (
+                    id,
+                    self.fresh_token(),
+                    pos,
+                    0,
+                    starting_inventory(),
+                    base,
+                    base,
+                    None,
+                )
             }
         };
         let epoch = self.next_epoch;
@@ -589,8 +598,7 @@ impl Sim {
                 p.bed_spawn
                     .and_then(|o| super::survival::bed_spawn_pos(&self.world, o))
                     .unwrap_or_else(|| super::survival::spawn_pos(&self.world)),
-                (ferraria_shared::PLAYER_BASE_MAX_HP.max(p.max_hp as u32 / 2) as u16)
-                    .min(p.max_hp),
+                (ferraria_shared::PLAYER_BASE_MAX_HP.max(p.max_hp as u32 / 2) as u16).min(p.max_hp),
             )
         } else {
             (p.pos, p.hp)

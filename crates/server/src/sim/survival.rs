@@ -20,17 +20,15 @@
 
 use ferraria_shared::items::{inventory, InvSlot, ItemId, POTION_SICKNESS_SECS};
 use ferraria_shared::loadout;
-use ferraria_shared::physics::{
-    fall_damage, hitbox, PlayerPhysics, PLAYER_HEIGHT, PLAYER_WIDTH,
-};
+use ferraria_shared::physics::{fall_damage, hitbox, PlayerPhysics, PLAYER_HEIGHT, PLAYER_WIDTH};
 use ferraria_shared::protocol::{anim, ActiveDebuff, Debuff, ServerMessage};
 use ferraria_shared::tiles::{LiquidKind, TileId, LAVA_BURN_SECS, LAVA_CONTACT_DAMAGE};
 use ferraria_shared::world::World;
 use ferraria_shared::{
     damage_dealt, BREATH_DRAIN_INTERVAL_TICKS, BREATH_REFILL_PER_TICK, BURNING_DPS,
-    DEATH_COIN_DROP_FRAC, DROWNING_DPS, PLAYER_BASE_MAX_HP, PLAYER_IFRAME_TICKS,
-    PLAYER_MAX_BREATH, PLAYER_MAX_MAX_HP, REGEN_DELAY_SECS, REGEN_HP_PER_SEC,
-    REGEN_STANDING_STILL_MULT, RESPAWN_SECS, RESPAWN_SECS_BOSS_ALIVE, TICK_RATE,
+    DEATH_COIN_DROP_FRAC, DROWNING_DPS, PLAYER_BASE_MAX_HP, PLAYER_IFRAME_TICKS, PLAYER_MAX_BREATH,
+    PLAYER_MAX_MAX_HP, REGEN_DELAY_SECS, REGEN_HP_PER_SEC, REGEN_STANDING_STILL_MULT, RESPAWN_SECS,
+    RESPAWN_SECS_BOSS_ALIVE, TICK_RATE,
 };
 
 use super::game::Sim;
@@ -362,7 +360,11 @@ impl Sim {
             // §8: landing in deep liquid is safe — and the shared physics
             // zeroes its own fall counter while swimming, so mirror that.
             p.fall_accum = 0.0;
-        } else if !p.was_grounded {
+        } else if !(grounded && p.was_grounded) {
+            // Any downward motion not between two grounded states is fall:
+            // this includes the takeoff and landing transition states, so a
+            // ledge drop spanning one report isn't undercounted. Walking
+            // down slopes (grounded→grounded) never accumulates.
             p.fall_accum += (p.pos.1 - old_pos.1).max(0.0);
         }
 
@@ -415,8 +417,8 @@ impl Sim {
                     changed = true;
                 } else {
                     // Drowning: 10/s, ignoring defense, no i-frames.
-                    p.drown_acc += DROWNING_DPS as f32 * BREATH_DRAIN_INTERVAL_TICKS as f32
-                        / TICK_RATE as f32;
+                    p.drown_acc +=
+                        DROWNING_DPS as f32 * BREATH_DRAIN_INTERVAL_TICKS as f32 / TICK_RATE as f32;
                     let whole = p.drown_acc.floor() as u32;
                     p.drown_acc -= whole as f32;
                     if whole > 0 {
@@ -428,8 +430,8 @@ impl Sim {
         } else if p.breath < PLAYER_MAX_BREATH as u16 {
             p.breath = (p.breath + BREATH_REFILL_PER_TICK as u16).min(PLAYER_MAX_BREATH as u16);
             p.drown_acc = 0.0;
-            changed = tick.is_multiple_of(BREATH_SYNC_TICKS)
-                || p.breath == PLAYER_MAX_BREATH as u16;
+            changed =
+                tick.is_multiple_of(BREATH_SYNC_TICKS) || p.breath == PLAYER_MAX_BREATH as u16;
         }
         if changed {
             let breath = p.breath;
@@ -543,7 +545,8 @@ fn point_in_liquid(world: &World, x: f32, y: f32) -> Option<LiquidKind> {
     let liquid = world.liquid(x.floor() as i32, y.floor() as i32);
     let kind = liquid.kind()?;
     let cell_bottom = y.floor() + 1.0;
-    let surface = cell_bottom - liquid.level() as f32 / ferraria_shared::tiles::LIQUID_MAX_LEVEL as f32;
+    let surface =
+        cell_bottom - liquid.level() as f32 / ferraria_shared::tiles::LIQUID_MAX_LEVEL as f32;
     (y >= surface).then_some(kind)
 }
 
@@ -587,13 +590,410 @@ fn touches_hellstone(world: &World, pos: (f32, f32)) -> bool {
     let (x1, y1) = ((pos.0 + w).floor() as i32, (pos.1 + h + 0.1).floor() as i32);
     for y in y0..=y1 {
         for x in x0..=x1 {
-            if x >= 0
-                && y >= 0
-                && world.tile(x as u32, y as u32).id == TileId::Hellstone
-            {
+            if x >= 0 && y >= 0 && world.tile(x as u32, y as u32).id == TileId::Hellstone {
                 return true;
             }
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::entities::EntityKind;
+    use super::super::game::Sim;
+    use super::super::test_util::*;
+    use super::*;
+    use ferraria_shared::protocol::ClientMessage;
+    use ferraria_shared::tiles::{Liquid, Tile};
+    use ferraria_shared::RESPAWN_SECS;
+
+    const FLOOR: u32 = 70;
+
+    fn setup() -> (
+        Sim,
+        u32,
+        u64,
+        tokio::sync::mpsc::Receiver<super::super::game::Frame>,
+    ) {
+        let mut sim = flat_sim(100, 100, FLOOR);
+        let (id, epoch, mut rx) = join(&mut sim, "vita");
+        drain(&mut rx);
+        place_player(&mut sim, id, 50.0, FLOOR as f32);
+        (sim, id, epoch, rx)
+    }
+
+    /// A walled basin of still water deep enough to submerge the player.
+    fn build_pool(sim: &mut Sim, x0: u32, x1: u32, depth: u32) {
+        for y in (FLOOR - depth)..FLOOR {
+            for x in x0..=x1 {
+                let mut t = Tile::AIR;
+                t.liquid = Liquid::new(LiquidKind::Water, 8);
+                sim.change_tile(x, y, t);
+            }
+            // Stone walls so the §3 automaton can't drain it sideways.
+            sim.change_tile(x0 - 1, y, Tile::of(TileId::Stone));
+            sim.change_tile(x1 + 1, y, Tile::of(TileId::Stone));
+        }
+    }
+
+    /// Sends an accepted PlayerState placing the feet-center at (x, y_feet).
+    fn report_state(sim: &mut Sim, id: u32, epoch: u64, x: f32, y_feet: f32, anim: u8) {
+        msg(
+            sim,
+            id,
+            epoch,
+            ClientMessage::PlayerState {
+                pos: (x - PLAYER_WIDTH / 2.0, y_feet - PLAYER_HEIGHT - 1e-3),
+                vel: (0.0, 0.0),
+                facing: 1,
+                anim,
+            },
+        );
+    }
+
+    // ---- Breath / drowning (§8) -------------------------------------------------
+
+    #[test]
+    fn breath_drains_drowns_and_refills_on_the_design_timeline() {
+        let (mut sim, id, _epoch, mut rx) = setup();
+        build_pool(&mut sim, 40, 60, 8);
+        place_player(&mut sim, id, 50.0, FLOOR as f32); // fully submerged
+        drain(&mut rx);
+
+        // Drain: 1 unit per 7 ticks.
+        advance(&mut sim, 70);
+        let b = sim.players[&id].breath;
+        assert!((189..=191).contains(&b), "70 ticks ≈ 10 units ({b})");
+        assert!(drain(&mut rx)
+            .iter()
+            .any(|m| matches!(m, ServerMessage::PlayerBreath { .. })));
+
+        // Empty the meter; drowning damage at 10/s ignoring defense.
+        sim.players.get_mut(&id).expect("p").breath = 0;
+        let hp0 = sim.players[&id].hp;
+        advance(&mut sim, 6 * 60);
+        let hp = sim.players[&id].hp;
+        let lost = (hp0 - hp) as i32;
+        assert!(
+            (55..=62).contains(&lost),
+            "≈10 dmg/s while drowning ({lost})"
+        );
+
+        // Climb out: refills 3/tick (≈1.1 s to full).
+        place_player(&mut sim, id, 20.0, FLOOR as f32);
+        advance(&mut sim, 70);
+        assert_eq!(sim.players[&id].breath, PLAYER_MAX_BREATH as u16);
+    }
+
+    // ---- Fall damage (§8) ----------------------------------------------------------
+
+    /// Walks the player through a reported fall of `tiles`, returns HP lost.
+    fn run_fall(sim: &mut Sim, id: u32, epoch: u64, tiles: f32, air_jump_at: Option<f32>) -> u32 {
+        let hp0 = sim.players[&id].hp;
+        let x = 50.0;
+        let top = FLOOR as f32 - tiles;
+        report_state(sim, id, epoch, x, top, anim::GROUNDED);
+        advance(sim, 1);
+        let mut y = top;
+        while y < FLOOR as f32 {
+            y = (y + 5.0).min(FLOOR as f32);
+            let mut flags = 0u8;
+            if let Some(at) = air_jump_at {
+                if y >= at && y - 5.0 < at {
+                    flags |= anim::AIR_JUMPED;
+                }
+            }
+            report_state(sim, id, epoch, x, y, flags);
+            advance(sim, 1);
+        }
+        report_state(sim, id, epoch, x, FLOOR as f32, anim::GROUNDED);
+        advance(sim, 1);
+        (hp0 - sim.players[&id].hp) as u32
+    }
+
+    #[test]
+    fn fall_damage_threshold_at_25_tiles() {
+        let (mut sim, id, epoch, _rx) = setup();
+        assert_eq!(run_fall(&mut sim, id, epoch, 25.0, None), 0, "25 is safe");
+        assert_eq!(
+            run_fall(&mut sim, id, epoch, 26.0, None),
+            10,
+            "10 dmg per tile past 25"
+        );
+        sim.players.get_mut(&id).expect("p").hp = 100;
+        assert_eq!(run_fall(&mut sim, id, epoch, 30.0, None), 50);
+    }
+
+    #[test]
+    fn lucky_charm_negates_fall_damage() {
+        let (mut sim, id, epoch, _rx) = setup();
+        let p = sim.players.get_mut(&id).expect("p");
+        p.inventory[inventory::ACCESSORY_START] = Some(InvSlot::new(ItemId::LuckyCharm, 1));
+        assert_eq!(run_fall(&mut sim, id, epoch, 40.0, None), 0);
+    }
+
+    #[test]
+    fn gust_jar_air_jump_resets_the_fall() {
+        let (mut sim, id, epoch, _rx) = setup();
+        {
+            let p = sim.players.get_mut(&id).expect("p");
+            p.inventory[inventory::ACCESSORY_START] = Some(InvSlot::new(ItemId::GustJar, 1));
+        }
+        // 40-tile fall with a mid-air jump 10 tiles above ground: only the
+        // last 10 tiles count → safe.
+        let dmg = run_fall(&mut sim, id, epoch, 40.0, Some(FLOOR as f32 - 10.0));
+        assert_eq!(dmg, 0, "air jump negates the fall so far");
+        // Without the Gust Jar equipped, the same flag is ignored. (Enough
+        // max HP that the 150 fall damage doesn't clip at death.)
+        {
+            let p = sim.players.get_mut(&id).expect("p");
+            p.inventory[inventory::ACCESSORY_START] = None;
+            p.max_hp = 400;
+            p.hp = 400;
+        }
+        let dmg = run_fall(&mut sim, id, epoch, 40.0, Some(FLOOR as f32 - 10.0));
+        assert_eq!(dmg, 150, "lying about AIR_JUMPED without the jar is futile");
+    }
+
+    #[test]
+    fn deep_water_landing_negates_fall_damage() {
+        let (mut sim, id, epoch, _rx) = setup();
+        build_pool(&mut sim, 45, 55, 6);
+        let dmg = run_fall(&mut sim, id, epoch, 40.0, None);
+        assert_eq!(dmg, 0, "§8: landing in deep liquid is safe");
+    }
+
+    // ---- Death & respawn (§8) ---------------------------------------------------
+
+    #[test]
+    fn death_drops_half_coins_and_respawn_restores_design_hp() {
+        let (mut sim, id, epoch, mut rx) = setup();
+        {
+            let p = sim.players.get_mut(&id).expect("p");
+            p.inventory[5] = Some(InvSlot::new(ItemId::CopperCoin, 75));
+            p.inventory[6] = Some(InvSlot::new(ItemId::SilverCoin, 3));
+        }
+        drain(&mut rx);
+        assert!(sim.hurt_player(id, 1000, Hurt::Raw));
+        assert!(sim.players[&id].dead);
+        let msgs = drain(&mut rx);
+        assert!(msgs.iter().any(|m| matches!(m,
+            ServerMessage::PlayerDied { id: pid } if *pid == id)));
+        // 50% of each coin stack (rounded down) dropped at the corpse.
+        let p = &sim.players[&id];
+        assert_eq!(p.inventory[5], Some(InvSlot::new(ItemId::CopperCoin, 38)));
+        assert_eq!(p.inventory[6], Some(InvSlot::new(ItemId::SilverCoin, 2)));
+        let dropped: Vec<(ItemId, u16)> = sim
+            .entities
+            .map
+            .values()
+            .filter_map(|e| match e.kind {
+                EntityKind::ItemDrop { item, count } => Some((item, count)),
+                _ => None,
+            })
+            .collect();
+        assert!(dropped.contains(&(ItemId::CopperCoin, 37)));
+        assert!(dropped.contains(&(ItemId::SilverCoin, 1)));
+
+        // Too early: the §8 timer (10 s) gates the respawn.
+        msg(&mut sim, id, epoch, ClientMessage::Respawn);
+        assert!(sim.players[&id].dead, "timer not elapsed");
+        advance(&mut sim, RESPAWN_SECS * 60 + 1);
+        msg(&mut sim, id, epoch, ClientMessage::Respawn);
+        let p = &sim.players[&id];
+        assert!(!p.dead);
+        assert_eq!(p.hp, 100, "max(100, 100/2) = 100");
+        let world_spawn = spawn_pos(sim.world());
+        assert!((p.pos.0 - world_spawn.0).abs() < 0.01, "at world spawn");
+        let msgs = drain(&mut rx);
+        assert!(msgs.iter().any(|m| matches!(m,
+            ServerMessage::PlayerRespawned { id: pid, .. } if *pid == id)));
+        assert!(
+            msgs.iter().any(|m| matches!(m,
+                ServerMessage::PlayerMoved { id: pid, .. } if *pid == id)),
+            "own-position correction so the client snaps"
+        );
+    }
+
+    #[test]
+    fn respawn_hp_is_max_of_100_and_half_max() {
+        let (mut sim, id, epoch, _rx) = setup();
+        {
+            let p = sim.players.get_mut(&id).expect("p");
+            p.max_hp = 400;
+            p.hp = 400;
+        }
+        sim.hurt_player(id, 5000, Hurt::Raw);
+        advance(&mut sim, RESPAWN_SECS * 60 + 1);
+        msg(&mut sim, id, epoch, ClientMessage::Respawn);
+        assert_eq!(sim.players[&id].hp, 200, "max(100, 400/2)");
+    }
+
+    #[test]
+    fn bed_spawn_used_when_bed_still_stands() {
+        let (mut sim, id, epoch, _rx) = setup();
+        // Place a bed on the floor and claim it.
+        assert!(sim.world.place_multitile(60, FLOOR - 2, TileId::Bed));
+        place_player(&mut sim, id, 58.0, FLOOR as f32);
+        sim.set_bed_spawn(id, 61, FLOOR - 2);
+        assert_eq!(sim.players[&id].bed_spawn, Some((60, FLOOR - 2)));
+
+        sim.hurt_player(id, 1000, Hurt::Raw);
+        advance(&mut sim, RESPAWN_SECS * 60 + 1);
+        msg(&mut sim, id, epoch, ClientMessage::Respawn);
+        let c = sim.players[&id].center();
+        assert!((c.0 - 62.0).abs() < 1.0, "respawned at the bed ({c:?})");
+
+        // Smash the bed: next death falls back to the world spawn.
+        sim.break_tile(60, FLOOR - 2);
+        sim.hurt_player(id, 1000, Hurt::Raw);
+        advance(&mut sim, RESPAWN_SECS * 60 + 1);
+        msg(&mut sim, id, epoch, ClientMessage::Respawn);
+        let world_spawn = spawn_pos(sim.world());
+        assert!((sim.players[&id].pos.0 - world_spawn.0).abs() < 0.01);
+    }
+
+    // ---- Debuffs, potions, regen ----------------------------------------------------
+
+    #[test]
+    fn burning_ticks_and_expires() {
+        let (mut sim, id, _epoch, mut rx) = setup();
+        sim.add_debuff(id, Debuff::Burning, 2 * TICK_RATE); // 2 s
+        assert!(sim.has_debuff(id, Debuff::Burning));
+        assert!(drain(&mut rx).iter().any(|m| matches!(m,
+            ServerMessage::PlayerDebuffs { debuffs, .. } if !debuffs.is_empty())));
+        advance(&mut sim, 2 * TICK_RATE + 2);
+        // §8: 2 dmg/s ignoring defense → 4 HP over 2 s.
+        assert_eq!(sim.players[&id].hp, 96);
+        assert!(!sim.has_debuff(id, Debuff::Burning), "expired");
+        assert!(drain(&mut rx).iter().any(|m| matches!(m,
+            ServerMessage::PlayerDebuffs { debuffs, .. } if debuffs.is_empty())));
+    }
+
+    #[test]
+    fn healing_potion_heals_and_sickness_blocks_the_second() {
+        let (mut sim, id, epoch, _rx) = setup();
+        give(&mut sim, id, 0, ItemId::LesserHealingPotion, 5);
+        sim.hurt_player(id, 60, Hurt::Raw);
+        assert_eq!(sim.players[&id].hp, 40);
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::UseItem {
+                slot: 0,
+                aim: (0.0, 0.0),
+            },
+        );
+        assert_eq!(sim.players[&id].hp, 90, "+50 (§4.4)");
+        assert!(sim.has_debuff(id, Debuff::PotionSickness));
+        assert_eq!(sim.players[&id].inventory[0].map(|s| s.count), Some(4));
+        // Second sip blocked by Potion Sickness.
+        advance(&mut sim, 40);
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::UseItem {
+                slot: 0,
+                aim: (0.0, 0.0),
+            },
+        );
+        assert_eq!(sim.players[&id].hp, 90);
+        assert_eq!(sim.players[&id].inventory[0].map(|s| s.count), Some(4));
+    }
+
+    #[test]
+    fn life_crystal_raises_max_hp_to_the_cap() {
+        let (mut sim, id, epoch, _rx) = setup();
+        give(&mut sim, id, 0, ItemId::LifeCrystal, 20);
+        for _ in 0..16 {
+            msg(
+                &mut sim,
+                id,
+                epoch,
+                ClientMessage::UseItem {
+                    slot: 0,
+                    aim: (0.0, 0.0),
+                },
+            );
+            advance(&mut sim, 20);
+        }
+        let p = &sim.players[&id];
+        assert_eq!(p.max_hp, 400, "§8 cap");
+        assert_eq!(p.hp, 400);
+        // 15 crystals consumed (the 16th refused at the cap).
+        assert_eq!(p.inventory[0].map(|s| s.count), Some(5));
+    }
+
+    #[test]
+    fn regen_starts_after_8s_and_band_of_vigor_stacks() {
+        let (mut sim, id, _epoch, _rx) = setup();
+        sim.hurt_player(id, 10, Hurt::Raw);
+        assert_eq!(sim.players[&id].hp, 90);
+        // Inside the 8 s window: nothing.
+        advance(&mut sim, 7 * 60);
+        assert_eq!(sim.players[&id].hp, 90);
+        // 4 s past the delay at 0.5 HP/s (anim isn't GROUNDED → no ×2): +2.
+        advance(&mut sim, 5 * 60);
+        assert_eq!(sim.players[&id].hp, 92);
+        // Band of Vigor: +0.5 → 1.0 HP/s.
+        {
+            let p = sim.players.get_mut(&id).expect("p");
+            p.inventory[inventory::ACCESSORY_START] = Some(InvSlot::new(ItemId::BandOfVigor, 1));
+        }
+        advance(&mut sim, 4 * 60);
+        assert_eq!(sim.players[&id].hp, 96);
+    }
+
+    #[test]
+    fn lava_contact_damages_burns_and_obsidian_charm_halves() {
+        let (mut sim, id, _epoch, _rx) = setup();
+        // A lava cell overlapping the player's feet.
+        let (x, y) = (50u32, FLOOR - 1);
+        let mut t = Tile::AIR;
+        t.liquid = Liquid::new(LiquidKind::Lava, 8);
+        sim.change_tile(x, y, t);
+        sim.change_tile(x - 1, y, Tile::of(TileId::Stone));
+        sim.change_tile(x + 1, y, Tile::of(TileId::Stone));
+        place_player(&mut sim, id, 50.5, FLOOR as f32);
+        advance(&mut sim, 1);
+        // §3: 50 contact damage (vs 0 defense) + Burning.
+        assert_eq!(sim.players[&id].hp, 50);
+        assert!(sim.has_debuff(id, Debuff::Burning));
+
+        // Obsidian Charm: half lava damage, Burning-immune.
+        let mut sim2 = flat_sim(100, 100, FLOOR);
+        let (id2, _e2, _rx2) = join(&mut sim2, "obsidian");
+        {
+            let p = sim2.players.get_mut(&id2).expect("p");
+            p.inventory[inventory::ACCESSORY_START] = Some(InvSlot::new(ItemId::ObsidianCharm, 1));
+        }
+        let mut t = Tile::AIR;
+        t.liquid = Liquid::new(LiquidKind::Lava, 8);
+        sim2.change_tile(x, y, t);
+        sim2.change_tile(x - 1, y, Tile::of(TileId::Stone));
+        sim2.change_tile(x + 1, y, Tile::of(TileId::Stone));
+        place_player(&mut sim2, id2, 50.5, FLOOR as f32);
+        advance(&mut sim2, 1);
+        assert_eq!(sim2.players[&id2].hp, 75, "halved to 25");
+        assert!(!sim2.has_debuff(id2, Debuff::Burning), "burn-immune");
+    }
+
+    #[test]
+    fn dead_players_cannot_act_on_the_world() {
+        let (mut sim, id, epoch, _rx) = setup();
+        sim.hurt_player(id, 1000, Hurt::Raw);
+        assert!(sim.players[&id].dead);
+        // A world swing from a corpse is dropped at dispatch.
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::HitTile { x: 50, y: FLOOR },
+        );
+        assert_eq!(sim.world().tile(50, FLOOR).id, TileId::Stone);
+        assert!(sim.tile_damage.is_empty());
+    }
 }

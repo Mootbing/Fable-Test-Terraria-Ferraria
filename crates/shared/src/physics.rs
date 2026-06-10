@@ -624,12 +624,21 @@ pub struct BodyStep {
     pub submerged: Option<LiquidKind>,
 }
 
+/// The body's feet rest on a solid or platform (the auto-step
+/// precondition: ledge-stepping is a *walking* move, not something a §5.2
+/// fighter does mid-jump — its 21 t/s jump must clear ~2.5 tiles, never 3).
+fn standing_on_ground(world: &World, pos: (f32, f32), size: (f32, f32)) -> bool {
+    let (c0, c1, _, _) = cells(pos, size);
+    let r = cell(pos.1 + size.1 + COLLISION_EPS);
+    (c0..=c1).any(|c| world.is_solid(c, r) || world.is_platform(c, r))
+}
+
 /// Advances a grounded enemy body (slimes, fighters) by `dt`: gravity under
 /// the §0 terminal cap (×§3 liquid multipliers while submerged),
 /// axis-separated AABB collision against solids + platform tops, cobweb
-/// clamping (§2), and — when `auto_step` — the same 1-tile ledge step
-/// players get (§5.2 Fighter AI). Knockback writes `vel` directly; this
-/// only integrates.
+/// clamping (§2), and — when `auto_step` and grounded — the same 1-tile
+/// ledge step players get (§5.2 Fighter AI). Knockback writes `vel`
+/// directly; this only integrates.
 pub fn step_enemy_body(
     world: &World,
     pos: &mut (f32, f32),
@@ -642,6 +651,7 @@ pub fn step_enemy_body(
         submerged: liquid_at_center(world, *pos, size),
         ..BodyStep::default()
     };
+    let grounded_entry = standing_on_ground(world, *pos, size);
     let in_liquid = out.submerged.is_some();
     let g_mult = if in_liquid { LIQUID_GRAVITY_MULT } else { 1.0 };
     let t_mult = if in_liquid { LIQUID_TERMINAL_MULT } else { 1.0 };
@@ -659,7 +669,7 @@ pub fn step_enemy_body(
     if dx != 0.0 {
         let (nx, blocked) = sweep_x(world, *pos, size, dx);
         let mut resolved = false;
-        if blocked && auto_step && vel.1 >= 0.0 {
+        if blocked && auto_step && grounded_entry {
             if let Some(stepped) = try_step_up(world, *pos, size, dx) {
                 *pos = stepped;
                 resolved = true;
@@ -1317,7 +1327,10 @@ mod tests {
             "walked to the wall (edge at {})",
             pos.0 + size.0
         );
-        assert!((pos.1 + size.1 - 9.0).abs() < 0.05, "auto-stepped the ledge");
+        assert!(
+            (pos.1 + size.1 - 9.0).abs() < 0.05,
+            "auto-stepped the ledge"
+        );
 
         // Without auto-step the same body is blocked at the ledge instead.
         let mut pos = (15.0, 10.0 - size.1 - COLLISION_EPS);
@@ -1378,8 +1391,14 @@ mod tests {
             "....#.....",
             "##########",
         ]);
-        assert!(!line_of_sight(&world, (1.5, 2.5), (8.5, 2.5)), "wall blocks");
-        assert!(line_of_sight(&world, (1.5, 0.5), (8.5, 0.5)), "over the top");
+        assert!(
+            !line_of_sight(&world, (1.5, 2.5), (8.5, 2.5)),
+            "wall blocks"
+        );
+        assert!(
+            line_of_sight(&world, (1.5, 0.5), (8.5, 0.5)),
+            "over the top"
+        );
         assert!(line_of_sight(&world, (1.5, 2.5), (3.5, 2.5)), "same side");
     }
 

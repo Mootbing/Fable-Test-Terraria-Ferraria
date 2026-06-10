@@ -492,10 +492,7 @@ mod tests {
             SpawnEnvironment::SurfaceNight
         );
         assert_eq!(spawn_environment(341, true), SpawnEnvironment::Underground);
-        assert_eq!(
-            spawn_environment(449, false),
-            SpawnEnvironment::Underground
-        );
+        assert_eq!(spawn_environment(449, false), SpawnEnvironment::Underground);
         assert_eq!(spawn_environment(450, true), SpawnEnvironment::Caverns);
         assert_eq!(spawn_environment(999, false), SpawnEnvironment::Caverns);
         assert_eq!(spawn_environment(1000, true), SpawnEnvironment::Underworld);
@@ -527,9 +524,8 @@ mod tests {
 
     #[test]
     fn species_weights_match_design() {
-        let sum = |env: SpawnEnvironment| -> u32 {
-            env.species_weights().iter().map(|&(_, w)| w).sum()
-        };
+        let sum =
+            |env: SpawnEnvironment| -> u32 { env.species_weights().iter().map(|&(_, w)| w).sum() };
         assert_eq!(sum(SpawnEnvironment::SurfaceDay), 100);
         assert_eq!(sum(SpawnEnvironment::SurfaceNight), 100);
         assert_eq!(sum(SpawnEnvironment::Underground), 100);

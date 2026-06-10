@@ -5,9 +5,7 @@
 //! Damage *to players* funnels through `sim::survival::hurt_player`
 //! (defense, §0 i-frames, knockback message, death).
 
-use ferraria_shared::enemies::{
-    self as ed, EnemyKind, KNOCKBACK_UP_MULT, PLAYER_KNOCKBACK_SPEED,
-};
+use ferraria_shared::enemies::{self as ed, EnemyKind, KNOCKBACK_UP_MULT, PLAYER_KNOCKBACK_SPEED};
 use ferraria_shared::items::{
     inventory, Consumable, InvSlot, ItemId, WeaponKind, ARROW_GRAVITY_MULT, ARROW_LIFETIME_SECS,
     ARROW_RECOVER_CHANCE, ARROW_SPEED, EMBER_BLADE_BURN_CHANCE, EMBER_BLADE_BURN_SECS,
@@ -15,9 +13,7 @@ use ferraria_shared::items::{
 };
 use ferraria_shared::physics::{step_flier_body, GRAVITY, TERMINAL_VELOCITY};
 use ferraria_shared::protocol::{Debuff, DespawnReason, ServerMessage};
-use ferraria_shared::{
-    damage_dealt, CRIT_CHANCE, CRIT_MULT, DT, ENEMY_IFRAME_TICKS, TICK_RATE,
-};
+use ferraria_shared::{damage_dealt, CRIT_CHANCE, CRIT_MULT, DT, ENEMY_IFRAME_TICKS, TICK_RATE};
 
 use super::entities::{Entity, EntityKind};
 use super::game::Sim;
@@ -117,8 +113,8 @@ impl Sim {
             return;
         };
         let effects = ferraria_shared::loadout::effect_mods(&p.inventory);
-        let attack = (w.damage as f32 * effects.damage_mult * effects.melee_damage_mult).round()
-            as u32;
+        let attack =
+            (w.damage as f32 * effects.damage_mult * effects.melee_damage_mult).round() as u32;
         let facing = if aim.0 >= p.center().0 { 1 } else { -1 };
         let burn = (item == ItemId::EmberBlade)
             .then_some((EMBER_BLADE_BURN_CHANCE, EMBER_BLADE_BURN_SECS));
@@ -222,7 +218,7 @@ impl Sim {
         e.hp_dirty = true;
         e.awake = true;
         e.ai.passive = false; // §5.1: passive only until damaged
-        // Knockback scaled by resist (−20% resist = 20% extra, §5.1).
+                              // Knockback scaled by resist (−20% resist = 20% extra, §5.1).
         let scale = (1.0 - data.kb_resist).max(0.0);
         if knockback > 0.0 && scale > 0.0 {
             e.vel.0 = dir.signum() * knockback * scale;
@@ -230,10 +226,7 @@ impl Sim {
         }
         if let Some((chance, secs)) = burn {
             if self.loot_rng.chance(chance) {
-                e.ai.burn_ticks = e
-                    .ai
-                    .burn_ticks
-                    .max((secs * TICK_RATE as f32) as u32);
+                e.ai.burn_ticks = e.ai.burn_ticks.max((secs * TICK_RATE as f32) as u32);
             }
         }
         let center = e.center();
@@ -266,7 +259,10 @@ impl Sim {
         // First arrow stack in slot order (hotbar then backpack).
         let Some(arrow_idx) = (0..inventory::ARMOR_START).find(|&i| {
             p.inventory[i].is_some_and(|s| {
-                s.item.data().weapon.is_some_and(|w| w.kind == WeaponKind::Arrow)
+                s.item
+                    .data()
+                    .weapon
+                    .is_some_and(|w| w.kind == WeaponKind::Arrow)
             })
         }) else {
             return; // no ammo
@@ -285,8 +281,8 @@ impl Sim {
 
         let effects = ferraria_shared::loadout::effect_mods(&p.inventory);
         let arrow_damage = fired.data().weapon.map(|w| w.damage).unwrap_or(0);
-        let attack = ((bow_stats.damage + arrow_damage) as f32 * effects.damage_mult).round()
-            as u16;
+        let attack =
+            ((bow_stats.damage + arrow_damage) as f32 * effects.damage_mult).round() as u16;
         let center = p.center();
         let d = {
             let (dx, dy) = (aim.0 - center.0, aim.1 - center.1);
@@ -349,9 +345,7 @@ impl Sim {
             .entities
             .map
             .iter()
-            .filter(|(_, e)| {
-                matches!(e.kind, EntityKind::Arrow { .. } | EntityKind::VoidSickle)
-            })
+            .filter(|(_, e)| matches!(e.kind, EntityKind::Arrow { .. } | EntityKind::VoidSickle))
             .map(|(&id, _)| id)
             .collect();
         for id in ids {
@@ -385,8 +379,8 @@ impl Sim {
         let step = step_flier_body(&self.world, &mut e.pos, &mut e.vel, size, DT);
         e.awake = true;
         let center = e.center();
-        let lifetime_over =
-            self.tick.saturating_sub(e.spawn_tick) >= (ARROW_LIFETIME_SECS * TICK_RATE as f32) as u64;
+        let lifetime_over = self.tick.saturating_sub(e.spawn_tick)
+            >= (ARROW_LIFETIME_SECS * TICK_RATE as f32) as u64;
         let hit_tile = step.blocked_x || step.on_ground || step.hit_ceiling;
         let dir = e.vel.0;
 
@@ -471,7 +465,9 @@ impl Sim {
             let applied = self.hurt_player(
                 pid,
                 ed::VOID_SICKLE_DAMAGE as u32,
-                Hurt::Hit { knockback: Some(kb) },
+                Hurt::Hit {
+                    knockback: Some(kb),
+                },
             );
             if applied {
                 if self.loot_rng.chance(ed::VOID_SICKLE_DARKNESS_CHANCE) {
@@ -547,7 +543,9 @@ impl Sim {
                 self.hurt_player(
                     pid,
                     t.kind.data().contact_damage as u32,
-                    Hurt::Hit { knockback: Some(kb) },
+                    Hurt::Hit {
+                        knockback: Some(kb),
+                    },
                 );
                 break; // one contact hit per tick; i-frames now hold anyway
             }
@@ -560,5 +558,339 @@ impl Sim {
             let tick = self.tick;
             self.enemy_iframes.retain(|_, &mut until| until > tick);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_util::*;
+    use super::*;
+    use ferraria_shared::enemies::SpawnEnvironment;
+    use ferraria_shared::protocol::ClientMessage;
+    use ferraria_shared::rng::Pcg32;
+
+    const FLOOR: u32 = 30;
+
+    fn hostile(sim: &mut Sim, kind: EnemyKind, x: f32) -> u32 {
+        sim.spawn_enemy(
+            kind,
+            {
+                let (w, h) = kind.data().size;
+                (x - w / 2.0, FLOOR as f32 - h - 1e-3)
+            },
+            SpawnEnvironment::SurfaceNight, // hostile regardless of time
+        )
+    }
+
+    /// Sim (night, so nothing dawn-flees mid-test) + one player standing at
+    /// x=50 on the floor.
+    fn setup() -> (
+        Sim,
+        u32,
+        u64,
+        tokio::sync::mpsc::Receiver<super::super::game::Frame>,
+    ) {
+        let mut sim = flat_sim(100, 60, FLOOR);
+        sim.world.time = 0;
+        let (id, epoch, mut rx) = join(&mut sim, "fighter");
+        drain(&mut rx);
+        place_player(&mut sim, id, 50.0, FLOOR as f32);
+        (sim, id, epoch, rx)
+    }
+
+    #[test]
+    fn melee_swing_damages_with_defense_crit_and_knockback() {
+        let (mut sim, id, epoch, mut rx) = setup();
+        give(&mut sim, id, 0, ItemId::WoodSword, 1); // 7 dmg, kb 5 (§4.1)
+        let eid = hostile(&mut sim, EnemyKind::BlueSlime, 52.0); // def 2, kb 0%
+        let hp0 = sim.entities.map[&eid].hp;
+        drain(&mut rx);
+
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::UseItem {
+                slot: 0,
+                aim: (53.0, FLOOR as f32 - 1.0),
+            },
+        );
+        advance(&mut sim, 1);
+        let hurt = drain(&mut rx)
+            .into_iter()
+            .find_map(|m| match m {
+                ServerMessage::EntityHurt { id, damage, crit } if id == eid => Some((damage, crit)),
+                _ => None,
+            })
+            .expect("EntityHurt broadcast");
+        // §0: damage = max(1, 7 − floor(2/2)) = 6, doubled (12 → 11) on crit.
+        let expect = if hurt.1 {
+            damage_dealt(14, 2)
+        } else {
+            damage_dealt(7, 2)
+        };
+        assert_eq!(hurt.0, expect);
+        let e = sim.entities.map[&eid];
+        assert_eq!(e.hp, hp0 - expect as u16);
+        // Knockback: kb 5, resist 0% → vx exactly +5, popped upward.
+        assert!((e.vel.0 - 5.0).abs() < 1e-3, "vx {}", e.vel.0);
+        assert!(e.vel.1 <= -5.0 * KNOCKBACK_UP_MULT + 1e-3, "vy {}", e.vel.1);
+        assert!(!e.ai.passive, "damage aggros");
+    }
+
+    #[test]
+    fn kb_resist_scales_and_negative_resist_amplifies() {
+        let (mut sim, _id, _epoch, _rx) = setup();
+        // Green Slime: −20% resist → ×1.2. Zombie: 50% → ×0.5.
+        let green = hostile(&mut sim, EnemyKind::GreenSlime, 60.0);
+        let zombie = hostile(&mut sim, EnemyKind::Zombie, 70.0);
+        sim.hurt_enemy(green, 1, 1, 5.0, 1.0, None);
+        sim.hurt_enemy(zombie, 1, 1, 5.0, -1.0, None);
+        let g = sim.entities.map[&green].vel;
+        let z = sim.entities.map[&zombie].vel;
+        assert!((g.0 - 6.0).abs() < 1e-3, "green vx {} (5 × 1.2)", g.0);
+        assert!((z.0 + 2.5).abs() < 1e-3, "zombie vx {} (−5 × 0.5)", z.0);
+    }
+
+    #[test]
+    fn enemy_iframes_block_same_source_but_not_others() {
+        let (mut sim, _id, _epoch, _rx) = setup();
+        let eid = hostile(&mut sim, EnemyKind::Zombie, 60.0);
+        let hp0 = sim.entities.map[&eid].hp;
+        sim.hurt_enemy(eid, 10, 1, 0.0, 1.0, None);
+        let hp1 = sim.entities.map[&eid].hp;
+        assert!(hp1 < hp0, "first hit lands");
+        // Same source, immediately: blocked.
+        sim.hurt_enemy(eid, 10, 1, 0.0, 1.0, None);
+        assert_eq!(sim.entities.map[&eid].hp, hp1, "i-frames block source 1");
+        // Different source: lands.
+        sim.hurt_enemy(eid, 10, 2, 0.0, 1.0, None);
+        let hp2 = sim.entities.map[&eid].hp;
+        assert!(hp2 < hp1, "other sources unaffected");
+        // After the 10-tick window: source 1 lands again.
+        sim.tick += ENEMY_IFRAME_TICKS as u64;
+        sim.hurt_enemy(eid, 10, 1, 0.0, 1.0, None);
+        assert!(sim.entities.map[&eid].hp < hp2, "window elapsed");
+    }
+
+    #[test]
+    fn crit_rate_is_about_four_percent() {
+        let (mut sim, _id, _epoch, _rx) = setup();
+        sim.loot_rng = Pcg32::new(1234);
+        let eid = hostile(&mut sim, EnemyKind::AshDemon, 60.0);
+        sim.entities.map.get_mut(&eid).expect("demon").hp = u16::MAX; // survive the sample
+                                                                      // Distinct source ids sidestep the i-frame gate per call.
+        let base = damage_dealt(10, EnemyKind::AshDemon.data().defense as u32);
+        let crit = damage_dealt(20, EnemyKind::AshDemon.data().defense as u32);
+        let (mut crits, trials) = (0u32, 3000u32);
+        for source in 0..trials {
+            let before = sim.entities.map[&eid].hp;
+            sim.hurt_enemy(eid, 10, source + 100, 0.0, 1.0, None);
+            let dealt = (before - sim.entities.map[&eid].hp) as u32;
+            if dealt == crit {
+                crits += 1;
+            } else {
+                assert_eq!(dealt, base, "non-crit damage");
+            }
+        }
+        let rate = crits as f32 / trials as f32;
+        assert!((0.02..0.065).contains(&rate), "crit rate {rate} (§0: 4%)");
+    }
+
+    #[test]
+    fn bow_consumes_arrows_and_terrain_recovery_is_half() {
+        let (mut sim, id, epoch, mut rx) = setup();
+        sim.loot_rng = Pcg32::new(7);
+        give(&mut sim, id, 0, ItemId::WoodenBow, 1);
+        sim.players.get_mut(&id).expect("p").inventory[1] =
+            Some(InvSlot::new(ItemId::WoodenArrow, 100));
+        drain(&mut rx);
+
+        let shots = 60u32;
+        for _ in 0..shots {
+            // Far across the map, so recovered drops land outside the
+            // shooter's auto-pickup radius.
+            msg(
+                &mut sim,
+                id,
+                epoch,
+                ClientMessage::UseItem {
+                    slot: 0,
+                    aim: (95.0, FLOOR as f32 - 1.0),
+                },
+            );
+            advance(&mut sim, 31); // §4.1 bow use time is 0.5 s
+        }
+        drain(&mut rx);
+        let p = &sim.players[&id];
+        let left = p.inventory[1].map(|s| s.count).unwrap_or(0);
+        assert_eq!(left, 100 - shots as u16, "one arrow per shot");
+        // Surviving recovered drops (merges preserve the total count).
+        let recovered: u32 = sim
+            .entities
+            .map
+            .values()
+            .filter_map(|e| match e.kind {
+                EntityKind::ItemDrop {
+                    item: ItemId::WoodenArrow,
+                    count,
+                } => Some(count as u32),
+                _ => None,
+            })
+            .sum();
+        let rate = recovered as f32 / shots as f32;
+        assert!(
+            (0.3..0.7).contains(&rate),
+            "recovery rate {rate} (§4.1: 50%)"
+        );
+    }
+
+    #[test]
+    fn arrows_damage_enemies_with_bow_plus_arrow_attack() {
+        let (mut sim, id, epoch, mut rx) = setup();
+        give(&mut sim, id, 0, ItemId::WoodenBow, 1); // 4 dmg
+        sim.players.get_mut(&id).expect("p").inventory[1] =
+            Some(InvSlot::new(ItemId::WoodenArrow, 10)); // 5 dmg
+                                                         // A tall target a few tiles away, straight ahead.
+        let eid = hostile(&mut sim, EnemyKind::Zombie, 56.0);
+        drain(&mut rx);
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::UseItem {
+                slot: 0,
+                aim: (56.0, FLOOR as f32 - 1.5),
+            },
+        );
+        advance(&mut sim, 20);
+        let hurt = drain(&mut rx)
+            .into_iter()
+            .find_map(|m| match m {
+                ServerMessage::EntityHurt { id, damage, crit } if id == eid => Some((damage, crit)),
+                _ => None,
+            })
+            .expect("arrow hit the zombie");
+        // §4.1: attack = bow 4 + arrow 5 = 9, vs the zombie's §5.1 defense.
+        let def = EnemyKind::Zombie.data().defense as u32;
+        let expect = if hurt.1 {
+            damage_dealt(18, def)
+        } else {
+            damage_dealt(9, def)
+        };
+        assert_eq!(hurt.0, expect);
+        // The arrow itself despawned on the hit (no terrain recovery roll).
+        assert!(!sim
+            .entities
+            .map
+            .values()
+            .any(|e| matches!(e.kind, EntityKind::Arrow { .. })));
+    }
+
+    #[test]
+    fn cinderbow_upgrades_wooden_arrows_to_flaming() {
+        let (mut sim, id, epoch, mut rx) = setup();
+        give(&mut sim, id, 0, ItemId::Cinderbow, 1);
+        sim.players.get_mut(&id).expect("p").inventory[1] =
+            Some(InvSlot::new(ItemId::WoodenArrow, 10));
+        drain(&mut rx);
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::UseItem {
+                slot: 0,
+                aim: (90.0, FLOOR as f32 - 5.0),
+            },
+        );
+        let spawned = drain(&mut rx)
+            .into_iter()
+            .find_map(|m| match m {
+                ServerMessage::EntitySpawn { kind, .. } => Some(kind),
+                _ => None,
+            })
+            .expect("projectile spawn");
+        assert_eq!(
+            spawned,
+            ferraria_shared::protocol::EntityKind::FlamingArrowProjectile
+        );
+    }
+
+    #[test]
+    fn enemy_contact_damages_knocks_back_and_respects_iframes() {
+        let (mut sim, id, epoch, mut rx) = setup();
+        // Zombie standing inside the player: contact 14 vs defense 0.
+        let _eid = hostile(&mut sim, EnemyKind::Zombie, 50.4);
+        drain(&mut rx);
+        advance(&mut sim, 1);
+        assert_eq!(sim.players[&id].hp, 100 - 14);
+        let msgs = drain(&mut rx);
+        assert!(msgs.iter().any(|m| matches!(m,
+            ServerMessage::PlayerHealth { id: pid, hp: 86, .. } if *pid == id)));
+        assert!(msgs
+            .iter()
+            .any(|m| matches!(m, ServerMessage::PlayerKnockback { .. })));
+        // §0 i-frames: 40 ticks of immunity even while overlapping.
+        advance(&mut sim, 30);
+        assert_eq!(sim.players[&id].hp, 86, "i-frames hold");
+        advance(&mut sim, 60);
+        assert!(sim.players[&id].hp < 86, "window elapsed → hit again");
+        let _ = epoch;
+    }
+
+    #[test]
+    fn passive_slimes_do_no_contact_damage_until_hit() {
+        let mut sim = flat_sim(100, 60, FLOOR);
+        let (id, _epoch, mut rx) = join(&mut sim, "alice");
+        drain(&mut rx);
+        place_player(&mut sim, id, 50.0, FLOOR as f32);
+        // Passive (surface day) slime on the player.
+        let eid = sim.spawn_enemy(
+            EnemyKind::GreenSlime,
+            (49.5, FLOOR as f32 - 2.0),
+            SpawnEnvironment::SurfaceDay,
+        );
+        advance(&mut sim, 30);
+        assert_eq!(sim.players[&id].hp, 100, "passive slime is harmless");
+        // Hit it once: aggro.
+        sim.hurt_enemy(eid, 1, id, 0.0, 1.0, None);
+        assert!(!sim.entities.map[&eid].ai.passive);
+        // Drop it back onto the player and let contact land.
+        if let Some(e) = sim.entities.map.get_mut(&eid) {
+            e.pos = (49.5, FLOOR as f32 - 2.0);
+            e.vel = (0.0, 0.0);
+        }
+        advance(&mut sim, 10);
+        assert!(sim.players[&id].hp < 100, "aggroed slime hurts");
+    }
+
+    #[test]
+    fn ash_demon_volley_fires_sickles_with_line_of_sight() {
+        let mut sim = flat_sim(160, 80, 60);
+        sim.world.time = 0;
+        let (id, _epoch, mut rx) = join(&mut sim, "alice");
+        drain(&mut rx);
+        place_player(&mut sim, id, 80.0, 60.0);
+        // Hovering demon with line of sight; volley cooldown starts at 0.
+        sim.spawn_enemy(
+            EnemyKind::AshDemon,
+            (70.0, 50.0),
+            SpawnEnvironment::Underworld,
+        );
+        advance(&mut sim, 3);
+        let sickles = sim
+            .entities
+            .map
+            .values()
+            .filter(|e| matches!(e.kind, EntityKind::VoidSickle))
+            .count() as u32;
+        assert_eq!(sickles, ed::SWOOPER_VOLLEY_COUNT, "§5.2: a volley of 4");
+        assert!(drain(&mut rx).iter().any(|m| matches!(
+            m,
+            ServerMessage::EntitySpawn {
+                kind: ferraria_shared::protocol::EntityKind::VoidSickleProjectile,
+                ..
+            }
+        )));
     }
 }

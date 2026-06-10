@@ -128,10 +128,7 @@ impl Sim {
         let player_centers: Vec<(f32, f32)> = self.players.values().map(|p| p.center()).collect();
         for _ in 0..ed::SPAWN_TRIES {
             let (dx, dy) = spawn_ring_offset(&mut self.spawn_rng);
-            let (cx, cy) = (
-                center.0 as i64 + dx as i64,
-                center.1 as i64 + dy as i64,
-            );
+            let (cx, cy) = (center.0 as i64 + dx as i64, center.1 as i64 + dy as i64);
             if cx < 0 || cy < 0 {
                 continue;
             }
@@ -176,9 +173,9 @@ impl Sim {
             hp: data.max_hp,
             hp_dirty: false,
             ai: AiState {
-                timer: self
-                    .spawn_rng
-                    .gen_range_u32(secs_ticks(ed::SLIME_IDLE_MIN_SECS)..secs_ticks(ed::SLIME_IDLE_MAX_SECS)),
+                timer: self.spawn_rng.gen_range_u32(
+                    secs_ticks(ed::SLIME_IDLE_MIN_SECS)..secs_ticks(ed::SLIME_IDLE_MAX_SECS),
+                ),
                 dir: if self.spawn_rng.chance(0.5) { 1 } else { -1 },
                 passive,
                 ..AiState::default()
@@ -331,7 +328,8 @@ impl Sim {
             if self.loot_rng.chance(row.chance) {
                 let n = self
                     .loot_rng
-                    .gen_range_u32(row.min as u32..row.max as u32 + 1) as u16;
+                    .gen_range_u32(row.min as u32..row.max as u32 + 1)
+                    as u16;
                 if n > 0 {
                     self.spawn_item_drop(row.item, n, center);
                 }
@@ -708,5 +706,411 @@ fn norm(v: (f32, f32)) -> (f32, f32) {
         (0.0, 0.0)
     } else {
         (v.0 / l, v.1 / l)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_util::*;
+    use super::*;
+    use ferraria_shared::protocol::{EntityKind as WireKind, ServerMessage};
+    use ferraria_shared::rng::Pcg32;
+    use ferraria_shared::tiles::{Tile, TileId};
+    use ferraria_shared::world::NEW_WORLD_TIME;
+
+    /// World from ASCII art: `#` stone, `.` air.
+    fn ascii_world(rows: &[&str]) -> World {
+        let mut w = World::new(rows[0].len() as u32, rows.len() as u32);
+        for (y, row) in rows.iter().enumerate() {
+            for (x, ch) in row.chars().enumerate() {
+                if ch == '#' {
+                    w.set_tile(x as u32, y as u32, Tile::of(TileId::Stone));
+                }
+            }
+        }
+        w
+    }
+
+    /// A wide flat world: all air above `floor`, stone below.
+    fn flat_world(width: u32, height: u32, floor: u32) -> World {
+        let mut w = World::new(width, height);
+        for y in floor..height {
+            for x in 0..width {
+                w.set_tile(x, y, Tile::of(TileId::Stone));
+            }
+        }
+        w
+    }
+
+    fn enemy_on_floor(kind: EnemyKind, x: f32, floor: u32) -> Entity {
+        let (w, h) = kind.data().size;
+        Entity {
+            pos: (x - w / 2.0, floor as f32 - h - 1e-3),
+            vel: (0.0, 0.0),
+            kind: EntityKind::Enemy(kind),
+            spawn_tick: 0,
+            awake: true,
+            hp: kind.data().max_hp,
+            hp_dirty: false,
+            ai: AiState {
+                timer: 60,
+                dir: 1,
+                ..AiState::default()
+            },
+        }
+    }
+
+    // ---- §5.2 golden AI tests ------------------------------------------------
+
+    #[test]
+    fn slime_hop_cadence_and_third_high_hop() {
+        let world = flat_world(200, 60, 40);
+        let mut rng = Pcg32::new(7);
+        let mut slime = enemy_on_floor(EnemyKind::GreenSlime, 50.0, 40);
+        let target = Some((120.0, 38.0)); // hostile, target to the right
+
+        // Record (tick, vy) at each hop launch.
+        let mut hops: Vec<(u32, f32, f32)> = Vec::new();
+        let mut prev_vy = 0.0f32;
+        for tick in 0..60 * 30 {
+            step_slime(&world, EnemyKind::GreenSlime, &mut slime, target, &mut rng);
+            if slime.vel.1 < -15.0 && prev_vy >= -1.0 {
+                hops.push((tick, slime.vel.0, slime.vel.1));
+            }
+            prev_vy = slime.vel.1;
+        }
+        assert!(hops.len() >= 6, "kept hopping ({} hops)", hops.len());
+        for (i, &(_, vx, vy)) in hops.iter().enumerate() {
+            // §5.2: vx 5.6 toward the player (target is to the right).
+            assert!((vx - ed::SLIME_HOP_VX).abs() < 1e-3, "hop {i} vx {vx}");
+            let expect = if (i + 1) % ed::SLIME_HIGH_HOP_EVERY as usize == 0 {
+                ed::SLIME_HIGH_HOP_VY // every 3rd hop is high
+            } else {
+                ed::SLIME_HOP_VY
+            };
+            assert!(
+                (vy + expect).abs() < 1e-3,
+                "hop {i} vy {vy}, want -{expect}"
+            );
+        }
+        // Idle gap between hops: 0.7–2.0 s plus the ~28-tick flight.
+        for pair in hops.windows(2) {
+            let gap = pair[1].0 - pair[0].0;
+            assert!(
+                (42 + 20..=120 + 40).contains(&gap),
+                "hop gap {gap} ticks out of the §5.2 cadence band"
+            );
+        }
+    }
+
+    #[test]
+    fn fighter_clears_two_tile_walls_but_not_three() {
+        // Floor top y=20, wall of stone at x=30 of the given height.
+        let walled = |wall_h: u32| -> World {
+            let mut w = flat_world(100, 40, 20);
+            for dy in 1..=wall_h {
+                w.set_tile(30, 20 - dy, Tile::of(TileId::Stone));
+            }
+            w
+        };
+        let run = |world: &World, ticks: u32| -> f32 {
+            let mut z = enemy_on_floor(EnemyKind::Zombie, 24.0, 20);
+            let target = Some((60.0, 18.0));
+            for _ in 0..ticks {
+                step_fighter(world, EnemyKind::Zombie, &mut z, target);
+            }
+            z.center().0
+        };
+        // 2-tile wall: §5.2 jump (vy 21 ≈ 2.45 tile apex) clears it.
+        assert!(
+            run(&walled(2), 1200) > 32.0,
+            "zombie failed to clear a 2-tile wall"
+        );
+        // 3-tile wall: stuck on the near side forever.
+        assert!(
+            run(&walled(3), 1800) < 30.0,
+            "zombie cleared a 3-tile wall (apex should be ~2.45 tiles)"
+        );
+        // 1-tile ledge: auto-step, no jump needed (§5.2).
+        let mut stepped = flat_world(100, 40, 20);
+        for x in 30..100 {
+            stepped.set_tile(x, 19, Tile::of(TileId::Stone));
+        }
+        let mut z = enemy_on_floor(EnemyKind::Zombie, 24.0, 20);
+        for _ in 0..600 {
+            step_fighter(&stepped, EnemyKind::Zombie, &mut z, Some((60.0, 17.0)));
+        }
+        assert!(z.center().0 > 35.0, "auto-stepped the 1-tile ledge");
+    }
+
+    #[test]
+    fn bouncer_reflects_and_kicks_up_on_walls() {
+        // Box with a wall at x=20; eye flies right at a target behind it.
+        let mut world = flat_world(60, 40, 35);
+        for y in 0..35 {
+            world.set_tile(20, y, Tile::of(TileId::Stone));
+        }
+        let mut eye = enemy_on_floor(EnemyKind::DemonEye, 10.0, 20);
+        eye.pos.1 = 15.0;
+        eye.vel = (8.0, 0.0);
+        let target = Some((40.0, 15.0));
+        let mut bounced = None;
+        for _ in 0..240 {
+            let before_vx = eye.vel.0;
+            step_bouncer(&world, &mut eye, target);
+            if before_vx > 0.0 && eye.vel.0 < 0.0 {
+                bounced = Some(eye.vel);
+                break;
+            }
+        }
+        let (vx, vy) = bounced.expect("hit the wall and reflected");
+        assert!(vx < 0.0, "horizontal velocity reflected");
+        assert!(
+            vy <= -ed::BOUNCER_BOUNCE_UP + 0.5,
+            "upward kick applied (vy {vy})"
+        );
+    }
+
+    // ---- §5.3 placement & spawn-algorithm tests --------------------------------
+
+    #[test]
+    fn placement_rules_ground_vs_air() {
+        let world = ascii_world(&[
+            "..........", // 0
+            "..........", // 1
+            "..........", // 2
+            "....#.....", // 3  lone block at (4,3)
+            "..........", // 4
+            "##########", // 5 floor
+        ]);
+        // Grounded: floor tile with 3×2 clear air above it.
+        assert!(placement_for(&world, EnemyKind::GreenSlime, 7, 5).is_some());
+        // Grounded on the floor under the lone block: air above (4,5) is
+        // blocked at (4,3)? No — only rows y-1, y-2 matter: (4,4) and (4,3);
+        // (4,3) is solid → refused.
+        assert!(placement_for(&world, EnemyKind::GreenSlime, 4, 5).is_none());
+        // Not solid → refused.
+        assert!(placement_for(&world, EnemyKind::GreenSlime, 2, 2).is_none());
+        // Flier: a 2×2 air pocket anywhere works...
+        assert!(placement_for(&world, EnemyKind::CaveBat, 1, 1).is_some());
+        // ...but not overlapping the lone block.
+        assert!(placement_for(&world, EnemyKind::CaveBat, 3, 2).is_none());
+        assert!(placement_for(&world, EnemyKind::CaveBat, 4, 3).is_none());
+        // Grounded placement stands on top of the tile.
+        let (_, h) = EnemyKind::GreenSlime.data().size;
+        let pos = placement_for(&world, EnemyKind::GreenSlime, 7, 5).expect("ground spot");
+        assert!((pos.1 + h - 5.0).abs() < 0.01, "feet on the floor top");
+    }
+
+    #[test]
+    fn surface_day_spawns_slimes_in_the_ring_up_to_cap() {
+        let mut sim = flat_sim(300, 200, 150);
+        assert_eq!(sim.world.time, NEW_WORLD_TIME, "day");
+        let (id, _epoch, mut rx) = join(&mut sim, "alice");
+        place_player(&mut sim, id, 150.0, 150.0);
+        drain(&mut rx);
+        let player = sim.players[&id].center();
+
+        advance(&mut sim, 6000);
+        let spawns: Vec<(WireKind, (f32, f32))> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|m| match m {
+                ServerMessage::EntitySpawn { kind, pos, .. } => Some((kind, pos)),
+                _ => None,
+            })
+            .collect();
+        assert!(!spawns.is_empty(), "surface-day spawns happened");
+        let (_, m) = SpawnEnvironment::SurfaceDay.spawn_params();
+        assert!(
+            sim.live_enemies() <= m,
+            "crowding capped at M={m}, got {}",
+            sim.live_enemies()
+        );
+        for (kind, pos) in &spawns {
+            // §5.3 step 5: surface day table is green/blue slimes only.
+            assert!(
+                matches!(kind, WireKind::GreenSlime | WireKind::BlueSlime),
+                "unexpected day species {kind:?}"
+            );
+            // §5.3 step 4: in the ring, outside the screen rect — measured
+            // at the enemy's center (what placement validated; the AABB
+            // top-left sits up to half a body inside it).
+            let (w, h) = EnemyKind::from_wire(*kind).expect("enemy kind").data().size;
+            let c = (pos.0 + w / 2.0, pos.1 + h / 2.0);
+            let (dx, dy) = (c.0 - player.0, c.1 - player.1);
+            assert!(
+                !ed::in_spawn_safe_rect(dx, dy),
+                "spawned on-screen at {pos:?}"
+            );
+            assert!(
+                dx.abs() <= ed::SPAWN_RING_OUTER_X as f32 + 2.0
+                    && dy.abs() <= ed::SPAWN_RING_OUTER_Y as f32 + 2.0,
+                "outside the outer ring: {pos:?}"
+            );
+        }
+        // Day-surface slimes are passive (§5.1).
+        assert!(sim
+            .entities
+            .map
+            .values()
+            .filter(|e| matches!(e.kind, EntityKind::Enemy(_)))
+            .all(|e| e.ai.passive));
+    }
+
+    #[test]
+    fn night_uses_the_night_table() {
+        let mut sim = flat_sim(300, 200, 150);
+        sim.world.time = 0; // midnight
+        let (id, _epoch, mut rx) = join(&mut sim, "alice");
+        place_player(&mut sim, id, 150.0, 150.0);
+        drain(&mut rx);
+        advance(&mut sim, 4000);
+        let kinds: Vec<WireKind> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|m| match m {
+                ServerMessage::EntitySpawn { kind, .. } => Some(kind),
+                _ => None,
+            })
+            .collect();
+        assert!(!kinds.is_empty(), "night spawns happened");
+        for kind in kinds {
+            assert!(
+                matches!(
+                    kind,
+                    WireKind::Zombie | WireKind::DemonEye | WireKind::BlueSlime
+                ),
+                "unexpected night species {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn crowding_at_cap_blocks_all_spawns() {
+        let mut sim = flat_sim(300, 200, 150);
+        let (id, _epoch, mut rx) = join(&mut sim, "alice");
+        place_player(&mut sim, id, 150.0, 150.0);
+        let (_, m) = SpawnEnvironment::SurfaceDay.spawn_params();
+        for i in 0..m {
+            sim.spawn_enemy(
+                EnemyKind::GreenSlime,
+                (140.0 + i as f32 * 4.0, 145.0),
+                SpawnEnvironment::SurfaceDay,
+            );
+        }
+        drain(&mut rx);
+        advance(&mut sim, 3000);
+        let new_spawns = drain(&mut rx)
+            .iter()
+            .filter(|msg| matches!(msg, ServerMessage::EntitySpawn { .. }))
+            .count();
+        assert_eq!(new_spawns, 0, "C ≥ M must block spawning");
+        assert_eq!(sim.live_enemies(), m);
+    }
+
+    #[test]
+    fn enemies_despawn_outside_all_player_rectangles() {
+        let mut sim = flat_sim(600, 200, 150);
+        sim.world.time = 0; // night — zombies must not dawn-flee mid-test
+        let (id, _epoch, mut rx) = join(&mut sim, "alice");
+        place_player(&mut sim, id, 100.0, 150.0);
+        // One enemy just inside the rect, one outside (dx > 168).
+        let near = sim.spawn_enemy(
+            EnemyKind::Zombie,
+            (220.0, 145.0),
+            SpawnEnvironment::SurfaceNight,
+        );
+        let far = sim.spawn_enemy(
+            EnemyKind::Zombie,
+            (350.0, 145.0),
+            SpawnEnvironment::SurfaceNight,
+        );
+        drain(&mut rx);
+        advance(&mut sim, DESPAWN_SWEEP_TICKS as u32 + 2);
+        assert!(sim.entities.map.contains_key(&near), "in range: kept");
+        assert!(!sim.entities.map.contains_key(&far), "out of range: gone");
+        assert!(drain(&mut rx).iter().any(|m| matches!(m,
+            ServerMessage::EntityDespawn { id, reason: DespawnReason::Despawned } if *id == far)));
+    }
+
+    // ---- §5.1 drop tables -------------------------------------------------------
+
+    #[test]
+    fn zombie_drop_table_distribution() {
+        let mut sim = flat_sim(100, 60, 30);
+        sim.loot_rng = Pcg32::new(42);
+        let trials = 2000u32;
+        let (mut wood_drops, mut arm_drops) = (0u32, 0u32);
+        let (mut coin_min, mut coin_max) = (u32::MAX, 0u32);
+        for _ in 0..trials {
+            let id = sim
+                .entities
+                .insert(enemy_on_floor(EnemyKind::Zombie, 50.0, 30));
+            sim.kill_enemy(id);
+            let mut coins = 0u32;
+            for e in sim.entities.map.values() {
+                let EntityKind::ItemDrop { item, count } = e.kind else {
+                    continue;
+                };
+                match item {
+                    ferraria_shared::items::ItemId::Wood => wood_drops += 1,
+                    ferraria_shared::items::ItemId::ZombieArm => arm_drops += 1,
+                    ferraria_shared::items::ItemId::CopperCoin => coins += count as u32,
+                    ferraria_shared::items::ItemId::SilverCoin => coins += count as u32 * 100,
+                    _ => {}
+                }
+            }
+            coin_min = coin_min.min(coins);
+            coin_max = coin_max.max(coins);
+            sim.entities.map.clear();
+        }
+        // §5.1: 50% 1 Wood, 2% Zombie Arm, 60 CC ± 20%.
+        let wood_pct = wood_drops as f32 / trials as f32;
+        let arm_pct = arm_drops as f32 / trials as f32;
+        assert!((0.46..0.54).contains(&wood_pct), "wood rate {wood_pct}");
+        assert!((0.008..0.035).contains(&arm_pct), "arm rate {arm_pct}");
+        assert!(
+            coin_min >= 48 && coin_max <= 72,
+            "coins {coin_min}..{coin_max}"
+        );
+    }
+
+    #[test]
+    fn slime_drops_gel_always_lava_slime_never() {
+        let mut sim = flat_sim(100, 60, 30);
+        sim.loot_rng = Pcg32::new(9);
+        for _ in 0..200 {
+            let id = sim
+                .entities
+                .insert(enemy_on_floor(EnemyKind::GreenSlime, 50.0, 30));
+            sim.kill_enemy(id);
+            let gel: u32 = sim
+                .entities
+                .map
+                .values()
+                .filter_map(|e| match e.kind {
+                    EntityKind::ItemDrop {
+                        item: ferraria_shared::items::ItemId::Gel,
+                        count,
+                    } => Some(count as u32),
+                    _ => None,
+                })
+                .sum();
+            assert!((1..=2).contains(&gel), "green slime gel {gel}");
+            sim.entities.map.clear();
+        }
+        let id = sim
+            .entities
+            .insert(enemy_on_floor(EnemyKind::LavaSlime, 50.0, 30));
+        sim.kill_enemy(id);
+        assert!(
+            !sim.entities.map.values().any(|e| matches!(
+                e.kind,
+                EntityKind::ItemDrop {
+                    item: ferraria_shared::items::ItemId::Gel,
+                    ..
+                }
+            )),
+            "lava slimes drop no gel (§5.1)"
+        );
     }
 }
