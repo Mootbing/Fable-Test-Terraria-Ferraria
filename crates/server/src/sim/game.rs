@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
 
+use ferraria_shared::inventory_ops::SlotOp;
 use ferraria_shared::items::{inventory, InvSlot, ItemId, STARTING_KIT};
 use ferraria_shared::physics::{PlayerPhysics, PLAYER_HEIGHT, PLAYER_WIDTH};
 use ferraria_shared::protocol::{encode, AuthToken, ClientMessage, ServerMessage};
@@ -85,8 +86,8 @@ pub enum SimCommand {
 }
 
 /// A connected player. `pub(crate)` so the sibling sim modules
-/// (`interact`, `entities`, `world_tick`) can implement their systems as
-/// further `impl Sim` blocks.
+/// (`interact`, `entities`, `inventory`, `world_tick`) can implement their
+/// systems as further `impl Sim` blocks.
 pub(crate) struct Player {
     pub(crate) name: String,
     token: AuthToken,
@@ -103,6 +104,9 @@ pub(crate) struct Player {
     pub(crate) held_slot: u8,
     /// Flat §8 layout (`items::inventory`), server-authoritative.
     pub(crate) inventory: Vec<Option<InvSlot>>,
+    /// Origin of the chest this player has open, if any (§11: a chest is
+    /// locked to one open player; mirrored in [`Sim::chest_locks`]).
+    pub(crate) open_chest: Option<(u32, u32)>,
     /// Chunks this session currently receives ([`ServerMessage::ChunkData`]
     /// sent on subscribe; tile deltas while subscribed).
     pub(crate) chunks: HashSet<(u32, u32)>,
@@ -167,6 +171,9 @@ pub struct Sim {
     pub(crate) tick: u64,
     pub(crate) players: HashMap<u32, Player>,
     offline: HashMap<String, OfflinePlayer>,
+    /// Chest origin → player id currently holding it open (§11: one opener
+    /// at a time; the reverse link is [`Player::open_chest`]).
+    pub(super) chest_locks: HashMap<(u32, u32), u32>,
     next_player_id: u32,
     /// Monotonic session-generation counter (player ids are reused across
     /// reconnects; epochs never are).
@@ -212,6 +219,7 @@ impl Sim {
             tick: 0,
             players: HashMap::new(),
             offline: HashMap::new(),
+            chest_locks: HashMap::new(),
             next_player_id: 1,
             next_epoch: 1,
             chunk_cache: HashMap::new(),
@@ -304,6 +312,11 @@ impl Sim {
         self.world_tick();
         self.tick_entities();
         self.revalidate_supports();
+
+        // Chest locks follow their openers: walking out of reach closes the
+        // chest (§11 — the client mirrors the same rule).
+        self.close_out_of_reach_chests();
+
         self.flush_held_item_broadcasts();
         self.flush_tile_batch();
         if self.tick.is_multiple_of(SNAPSHOT_INTERVAL_TICKS as u64) {
@@ -372,6 +385,7 @@ impl Sim {
             moved: false,
             held_slot,
             inventory: inv,
+            open_chest: None,
             chunks: HashSet::new(),
             last_state_tick: self.tick,
             // One tick of allowance until the first state replenishes it.
@@ -480,6 +494,7 @@ impl Sim {
 
     /// Removes a player, parks their state for re-join, tells everyone else.
     fn remove_player(&mut self, id: u32) {
+        self.release_chest(id); // free any chest lock (§11)
         let Some(p) = self.players.remove(&id) else {
             return; // disconnect raced a kick — already gone
         };
@@ -543,6 +558,19 @@ impl Sim {
                 self.place_wall(id, x, y, hotbar_slot)
             }
             ClientMessage::ToggleDoor { x, y } => self.toggle_door(id, x, y),
+            ClientMessage::MoveSlot { from, to } => self.inv_slot_op(id, from, to, SlotOp::Move),
+            ClientMessage::SplitSlot { from, to } => {
+                self.inv_slot_op(id, from, to, SlotOp::SplitHalf)
+            }
+            ClientMessage::DropItem { slot, count } => self.drop_item(id, slot, count),
+            ClientMessage::Craft { recipe_id } => self.craft(id, recipe_id),
+            ClientMessage::OpenChest { x, y } => self.open_chest(id, x, y),
+            ClientMessage::CloseChest => self.close_chest(id),
+            ClientMessage::ChestMoveSlot {
+                chest_slot,
+                inv_slot,
+                to_chest,
+            } => self.chest_move_slot(id, chest_slot, inv_slot, to_chest),
             other => {
                 tracing::debug!(player = id, msg = ?other, "intent not implemented yet");
             }
@@ -891,7 +919,7 @@ impl Sim {
         self.broadcast_frame(&frame, None);
     }
 
-    fn broadcast_frame(&mut self, frame: &Frame, except: Option<u32>) {
+    pub(super) fn broadcast_frame(&mut self, frame: &Frame, except: Option<u32>) {
         let mut dead = Vec::new();
         for (&id, p) in &self.players {
             if Some(id) == except {
@@ -1027,14 +1055,14 @@ fn entropy_seed() -> u64 {
     hasher.finish()
 }
 
+/// Test plumbing shared by this module's tests and `sim::inventory`'s.
 #[cfg(test)]
-mod tests {
+pub(super) mod testutil {
     use super::*;
     use ferraria_shared::protocol::decode;
-    use ferraria_shared::world::NEW_WORLD_TIME;
 
     /// A sim over a small empty world with an inspectable player counter.
-    fn test_sim() -> Sim {
+    pub fn test_sim() -> Sim {
         let mut world = World::new(320, 320);
         world.spawn = (160, 100);
         Sim::new(world, Arc::new(AtomicUsize::new(0)))
@@ -1042,7 +1070,7 @@ mod tests {
 
     /// Joins a player, returning their id, session epoch, and the outbound
     /// frame receiver.
-    fn join(
+    pub fn join(
         sim: &mut Sim,
         name: &str,
         token: Option<AuthToken>,
@@ -1052,7 +1080,7 @@ mod tests {
         (id, epoch, rx)
     }
 
-    fn try_join(
+    pub fn try_join(
         sim: &mut Sim,
         name: &str,
         token: Option<AuthToken>,
@@ -1069,7 +1097,7 @@ mod tests {
     }
 
     /// Shorthand for an in-game message from a live session.
-    fn msg(sim: &mut Sim, player_id: u32, epoch: u64, msg: ClientMessage) {
+    pub fn msg(sim: &mut Sim, player_id: u32, epoch: u64, msg: ClientMessage) {
         sim.handle(SimCommand::Message {
             player_id,
             epoch,
@@ -1077,13 +1105,20 @@ mod tests {
         });
     }
 
-    fn drain(rx: &mut mpsc::Receiver<Frame>) -> Vec<ServerMessage> {
+    pub fn drain(rx: &mut mpsc::Receiver<Frame>) -> Vec<ServerMessage> {
         let mut out = Vec::new();
         while let Ok(frame) = rx.try_recv() {
             out.push(decode::<ServerMessage>(&frame).expect("valid frame"));
         }
         out
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testutil::*;
+    use super::*;
+    use ferraria_shared::world::NEW_WORLD_TIME;
 
     #[test]
     fn join_sends_welcome_inventory_time_and_chunks() {

@@ -4,6 +4,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::items::{InvSlot, ItemId};
+use crate::tiles::{state, TileId};
+use crate::world::World;
 
 /// Crafting stations (§4.4). A recipe is craftable when its station is
 /// within [`crate::STATION_RANGE`] (4) tiles — note this is *not* the 6-tile
@@ -197,6 +199,44 @@ pub fn recipes_available(
         .filter(move |r| stations.contains(r.station) && can_craft(r, slots))
 }
 
+/// Crafting stations within [`crate::STATION_RANGE`] (4 tiles, §4.4) of
+/// `center` (the player's center, tile units): every tile cell whose own
+/// center is in range and that provides a station counts — so being near
+/// *any* tile of a multi-tile station is enough. A Bottle placed on a
+/// Table/Workbench cell ([`state::BOTTLE_ON_TOP`]) provides
+/// [`Station::Bottle`].
+///
+/// Shared so the server (Craft validation) and the client (recipe-list
+/// filtering) agree exactly; the server stays the authority.
+pub fn stations_in_range(world: &World, center: (f32, f32)) -> StationSet {
+    let mut stations = StationSet::empty();
+    let r = crate::STATION_RANGE;
+    let x0 = (center.0 - r).floor().max(0.0) as u32;
+    let y0 = (center.1 - r).floor().max(0.0) as u32;
+    let x1 = ((center.0 + r).ceil() as u32).min(world.width.saturating_sub(1));
+    let y1 = ((center.1 + r).ceil() as u32).min(world.height.saturating_sub(1));
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let (dx, dy) = (x as f32 + 0.5 - center.0, y as f32 + 0.5 - center.1);
+            if dx * dx + dy * dy > r * r {
+                continue;
+            }
+            let t = world.tile(x, y);
+            if let Some(s) = t.id.data().station {
+                stations.insert(s);
+            }
+            // The server sets BOTTLE_ON_TOP when a Bottle item is placed
+            // onto a Table/Workbench cell (`sim::interact::place_bottle`).
+            if matches!(t.id, TileId::Table | TileId::Workbench)
+                && t.state & state::BOTTLE_ON_TOP != 0
+            {
+                stations.insert(Station::Bottle);
+            }
+        }
+    }
+    stations
+}
+
 /// Removes `count` of `item` from the slots (which must contain enough).
 fn consume(slots: &mut [Option<InvSlot>], item: ItemId, count: u16) {
     let mut left = count;
@@ -218,14 +258,14 @@ fn consume(slots: &mut [Option<InvSlot>], item: ItemId, count: u16) {
 }
 
 /// Adds `count` of `item`, stacking onto existing stacks first, then into
-/// empty slots. Returns `false` (leaving `slots` modified!) if it doesn't
-/// fit — callers use [`apply_craft`], which stays transactional.
-fn insert(slots: &mut [Option<InvSlot>], item: ItemId, count: u16) -> bool {
+/// empty slots. Returns the count that did not fit (0 = everything placed;
+/// `slots` is left modified either way — callers handle transactionality).
+fn insert(slots: &mut [Option<InvSlot>], item: ItemId, count: u16) -> u16 {
     let max = item.max_stack();
     let mut left = count;
     for slot in slots.iter_mut() {
         if left == 0 {
-            return true;
+            return 0;
         }
         if let Some(s) = slot {
             if s.item == item && s.count < max {
@@ -237,7 +277,7 @@ fn insert(slots: &mut [Option<InvSlot>], item: ItemId, count: u16) -> bool {
     }
     for slot in slots.iter_mut() {
         if left == 0 {
-            return true;
+            return 0;
         }
         if slot.is_none() {
             let add = max.min(left);
@@ -245,25 +285,40 @@ fn insert(slots: &mut [Option<InvSlot>], item: ItemId, count: u16) -> bool {
             left -= add;
         }
     }
-    left == 0
+    left
 }
 
 /// Crafts `recipe` against `slots`: consumes inputs and inserts the output.
 /// Transactional — on `false` (missing ingredients or no room for the
 /// output) `slots` is unchanged. The station check is the caller's job.
 pub fn apply_craft(recipe: &Recipe, slots: &mut [Option<InvSlot>]) -> bool {
+    matches!(apply_craft_overflow(recipe, slots, false), Some(0))
+}
+
+/// Like [`apply_craft`], but with `allow_overflow` the craft succeeds even
+/// when the output doesn't fully fit: inputs are consumed, what fits is
+/// inserted, and the overflow count is returned for the caller to drop on
+/// the ground (§4.4 crafting always yields its output). Returns `None`
+/// (slots unchanged) when ingredients are missing — or when overflow is
+/// disallowed and the output has no room.
+pub fn apply_craft_overflow(
+    recipe: &Recipe,
+    slots: &mut [Option<InvSlot>],
+    allow_overflow: bool,
+) -> Option<u16> {
     if !can_craft(recipe, slots) {
-        return false;
+        return None;
     }
     let mut work = slots.to_vec();
     for &(item, need) in recipe.inputs {
         consume(&mut work, item, need);
     }
-    if !insert(&mut work, recipe.output, recipe.count) {
-        return false;
+    let overflow = insert(&mut work, recipe.output, recipe.count);
+    if overflow > 0 && !allow_overflow {
+        return None;
     }
     slots.copy_from_slice(&work);
-    true
+    Some(overflow)
 }
 
 #[cfg(test)]
@@ -380,6 +435,60 @@ mod tests {
         ];
         assert!(apply_craft(arrows, &mut slots));
         assert_eq!(count_item(&slots, I::WoodenArrow), 25);
+    }
+
+    #[test]
+    fn craft_overflow_consumes_and_reports_the_excess() {
+        // 25 arrows out, but only 990..999 fits onto the existing stack.
+        let arrows = recipe_by_id(45).expect("arrows");
+        let mut slots = vec![
+            Some(InvSlot::new(I::Wood, 2)),
+            Some(InvSlot::new(I::Stone, 2)),
+            Some(InvSlot::new(I::WoodenArrow, 990)),
+        ];
+        let over = apply_craft_overflow(arrows, &mut slots, true).expect("crafts");
+        assert_eq!(over, 16, "9 fit on the stack, 16 overflow");
+        assert_eq!(count_item(&slots, I::WoodenArrow), 999);
+        assert_eq!(count_item(&slots, I::Wood), 1);
+        // Missing inputs still fail without touching anything.
+        let mut empty: Vec<Option<InvSlot>> = vec![None; 5];
+        assert_eq!(apply_craft_overflow(arrows, &mut empty, true), None);
+    }
+
+    #[test]
+    fn stations_detected_within_range_4() {
+        use crate::tiles::Tile;
+        let mut w = World::new(64, 64);
+        // 2×1 workbench at (10, 10); 3×2 furnace at (30, 10).
+        assert!(w.place_multitile(10, 10, TileId::Workbench));
+        assert!(w.place_multitile(30, 10, TileId::Furnace));
+
+        // Standing right next to the bench: in range. Center of cell (10,10)
+        // is (10.5, 10.5).
+        let near = stations_in_range(&w, (12.0, 10.5));
+        assert!(near.contains(Station::Workbench));
+        assert!(near.contains(Station::Hands), "hands always available");
+        assert!(!near.contains(Station::Furnace));
+
+        // 4 tiles from the bench's right cell (11,10): center distance from
+        // (15.5, 10.5) to (11.5, 10.5) is exactly 4 — any tile of the
+        // station counts.
+        assert!(stations_in_range(&w, (15.5, 10.5)).contains(Station::Workbench));
+        // A hair past 4 from every cell: out of range.
+        assert!(!stations_in_range(&w, (16.2, 10.5)).contains(Station::Workbench));
+
+        // Bottle on a table enables the Bottle station (§4.4).
+        assert!(w.place_multitile(20, 20, TileId::Table));
+        assert!(!stations_in_range(&w, (21.0, 21.0)).contains(Station::Bottle));
+        let mut t = w.tile(20, 20);
+        t.state |= state::BOTTLE_ON_TOP;
+        w.set_tile(20, 20, t);
+        assert!(stations_in_range(&w, (21.0, 21.0)).contains(Station::Bottle));
+        // ...but DOOR_OPEN shares the bit and must not leak from doors.
+        let mut door = Tile::of(TileId::Door);
+        door.state |= state::DOOR_OPEN;
+        w.set_tile(40, 40, door);
+        assert!(!stations_in_range(&w, (40.5, 40.5)).contains(Station::Bottle));
     }
 
     #[test]
