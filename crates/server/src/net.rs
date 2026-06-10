@@ -79,23 +79,27 @@ async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl
 
 /// One task per connection: handshake, then pump until either side closes.
 async fn session(mut socket: WebSocket, sim_tx: mpsc::Sender<SimCommand>) {
-    let Some((player_id, outbound_rx)) = handshake(&mut socket, &sim_tx).await else {
+    let Some((player_id, epoch, outbound_rx)) = handshake(&mut socket, &sim_tx).await else {
         return;
     };
-    pump(socket, &sim_tx, player_id, outbound_rx).await;
-    // Idempotent: the sim ignores ids it already removed (kicks).
-    let _ = sim_tx.send(SimCommand::Disconnect { player_id }).await;
+    pump(socket, &sim_tx, player_id, epoch, outbound_rx).await;
+    // Safe even after a kick: the sim only removes the player if `epoch`
+    // still matches — a late Disconnect from this (stale) session can never
+    // boot a successor that reclaimed the same player id meanwhile.
+    let _ = sim_tx
+        .send(SimCommand::Disconnect { player_id, epoch })
+        .await;
 }
 
 /// Reads `Hello`, gates `PROTOCOL_VERSION` here, and delegates the stateful
 /// checks (full server, duplicate name, token reclaim) to the sim. Returns
-/// the assigned player id and the queue the sim will write frames into;
-/// `None` means the connection was rejected/closed (any `Reject` has been
-/// sent).
+/// the assigned player id, this session's epoch, and the queue the sim will
+/// write frames into; `None` means the connection was rejected/closed (any
+/// `Reject` has been sent).
 async fn handshake(
     socket: &mut WebSocket,
     sim_tx: &mpsc::Sender<SimCommand>,
-) -> Option<(u32, mpsc::Receiver<Frame>)> {
+) -> Option<(u32, u64, mpsc::Receiver<Frame>)> {
     let hello = loop {
         // Timeout, closed socket, or transport error: just drop the
         // connection — there is no one to talk to.
@@ -142,7 +146,7 @@ async fn handshake(
         .await
         .ok()?;
     match reply_rx.await {
-        Ok(Ok(player_id)) => Some((player_id, rx)),
+        Ok(Ok((player_id, epoch))) => Some((player_id, epoch, rx)),
         Ok(Err(reason)) => {
             reject(socket, reason).await;
             None
@@ -164,6 +168,7 @@ async fn pump(
     socket: WebSocket,
     sim_tx: &mpsc::Sender<SimCommand>,
     player_id: u32,
+    epoch: u64,
     mut outbound_rx: mpsc::Receiver<Frame>,
 ) {
     let (mut sink, mut stream) = socket.split();
@@ -183,7 +188,11 @@ async fn pump(
             Message::Binary(bytes) => match decode::<ClientMessage>(&bytes) {
                 Some(msg) => {
                     if sim_tx
-                        .send(SimCommand::Message { player_id, msg })
+                        .send(SimCommand::Message {
+                            player_id,
+                            epoch,
+                            msg,
+                        })
                         .await
                         .is_err()
                     {

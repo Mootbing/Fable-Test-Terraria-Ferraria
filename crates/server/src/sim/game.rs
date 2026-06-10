@@ -31,8 +31,8 @@ use ferraria_shared::world::{
     World, CHUNK_SIZE, CHUNK_SUB_HYSTERESIS, CHUNK_SUB_RADIUS_X, CHUNK_SUB_RADIUS_Y, DAY_TICKS,
 };
 use ferraria_shared::{
-    CHAT_MAX_CHARS, MAX_NAME_CHARS, MAX_PLAYERS, MAX_PLAYER_SPEED, MAX_TELEPORT_PER_TICK,
-    SNAPSHOT_INTERVAL_TICKS, TICK_RATE, TIME_SYNC_INTERVAL_TICKS,
+    CHAT_MAX_CHARS, MAX_NAME_CHARS, MAX_PLAYERS, MAX_PLAYER_SPEED, MAX_TELEPORT_BUDGET_TILES,
+    MAX_TELEPORT_PER_TICK, SNAPSHOT_INTERVAL_TICKS, TICK_RATE, TIME_SYNC_INTERVAL_TICKS,
 };
 
 /// One encoded `ServerMessage`, shared between sessions without re-encoding.
@@ -52,27 +52,40 @@ const LAG_WARN_THRESHOLD: Duration = Duration::from_millis(250);
 const LAG_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// What sessions send the sim.
+///
+/// `epoch` is the per-session generation the sim minted in the `Join` reply.
+/// Player ids are reused across reconnects (token reclaim keeps the id), so
+/// a kicked session's late `Message`/`Disconnect` must not be honored once a
+/// successor session owns the same id — the sim drops commands whose epoch
+/// doesn't match the current occupant's.
 pub enum SimCommand {
     /// Handshake (after the session validated `PROTOCOL_VERSION`). On
     /// success the sim queues Welcome + join state on `tx` and replies
-    /// `Ok(player_id)`; on failure it replies `Err(reason)` and the session
-    /// sends the `Reject`.
+    /// `Ok((player_id, epoch))`; on failure it replies `Err(reason)` and the
+    /// session sends the `Reject`.
     Join {
         name: String,
         token: Option<AuthToken>,
         tx: mpsc::Sender<Frame>,
-        reply: oneshot::Sender<Result<u32, String>>,
+        reply: oneshot::Sender<Result<(u32, u64), String>>,
     },
     /// A decoded in-game message from a connected player.
-    Message { player_id: u32, msg: ClientMessage },
+    Message {
+        player_id: u32,
+        epoch: u64,
+        msg: ClientMessage,
+    },
     /// The session's socket closed.
-    Disconnect { player_id: u32 },
+    Disconnect { player_id: u32, epoch: u64 },
 }
 
 /// A connected player.
 struct Player {
     name: String,
     token: AuthToken,
+    /// Session generation; commands carrying a different epoch are stale
+    /// (see [`SimCommand`]).
+    epoch: u64,
     /// Top-left of the AABB, tile units (the `PlayerState` convention).
     pos: (f32, f32),
     vel: (f32, f32),
@@ -86,8 +99,15 @@ struct Player {
     /// Chunks this session currently receives ([`ServerMessage::ChunkData`]
     /// sent on subscribe; tile deltas while subscribed).
     chunks: HashSet<(u32, u32)>,
-    /// Sim tick when the last `PlayerState` was accepted (teleport clamp).
+    /// Sim tick when the last `PlayerState` was processed (replenishes
+    /// `move_budget`).
     last_state_tick: u64,
+    /// Remaining displacement allowance for the teleport clamp, in tiles.
+    /// Refills [`MAX_TELEPORT_PER_TICK`] per elapsed tick, capped at
+    /// [`MAX_TELEPORT_BUDGET_TILES`]; every accepted `PlayerState` consumes
+    /// its actual distance, so stacking messages within one tick cannot
+    /// stack fresh clamp budgets.
+    move_budget: f32,
     tx: mpsc::Sender<Frame>,
 }
 
@@ -126,6 +146,9 @@ pub struct Sim {
     players: HashMap<u32, Player>,
     offline: HashMap<String, OfflinePlayer>,
     next_player_id: u32,
+    /// Monotonic session-generation counter (player ids are reused across
+    /// reconnects; epochs never are).
+    next_epoch: u64,
     /// Encoded `ChunkData` frames; invalidated by [`Sim::change_tile`].
     chunk_cache: HashMap<(u32, u32), Frame>,
     /// Fallback token entropy when /dev/urandom is unavailable.
@@ -145,6 +168,7 @@ impl Sim {
             players: HashMap::new(),
             offline: HashMap::new(),
             next_player_id: 1,
+            next_epoch: 1,
             chunk_cache: HashMap::new(),
             token_rng: Pcg32::new(entropy_seed()),
             pending_kicks: Vec::new(),
@@ -162,8 +186,12 @@ impl Sim {
                 tx,
                 reply,
             } => self.join(name, token, tx, reply),
-            SimCommand::Message { player_id, msg } => self.handle_message(player_id, msg),
-            SimCommand::Disconnect { player_id } => self.remove_player(player_id),
+            SimCommand::Message {
+                player_id,
+                epoch,
+                msg,
+            } => self.handle_message(player_id, epoch, msg),
+            SimCommand::Disconnect { player_id, epoch } => self.disconnect(player_id, epoch),
         }
         self.flush_kicks();
     }
@@ -223,7 +251,7 @@ impl Sim {
         raw_name: String,
         token: Option<AuthToken>,
         tx: mpsc::Sender<Frame>,
-        reply: oneshot::Sender<Result<u32, String>>,
+        reply: oneshot::Sender<Result<(u32, u64), String>>,
     ) {
         let Some(name) = sanitize_name(&raw_name) else {
             let _ = reply.send(Err(format!(
@@ -260,9 +288,12 @@ impl Sim {
                 (id, self.fresh_token(), pos, 0, starting_inventory())
             }
         };
+        let epoch = self.next_epoch;
+        self.next_epoch += 1;
         let player = Player {
             name: name.clone(),
             token,
+            epoch,
             pos,
             vel: (0.0, 0.0),
             facing: 1,
@@ -272,6 +303,8 @@ impl Sim {
             inventory: inv,
             chunks: HashSet::new(),
             last_state_tick: self.tick,
+            // One tick of allowance until the first state replenishes it.
+            move_budget: MAX_TELEPORT_PER_TICK,
             tx,
         };
 
@@ -288,8 +321,9 @@ impl Sim {
             item: player.held_item(),
         });
 
-        // Queue the newcomer's join state in order: Welcome first, then
-        // inventory, time, the existing-player roster, then chunks.
+        // Queue the newcomer's join state in order: Welcome first, then the
+        // player's own authoritative position, inventory, time, the
+        // existing-player roster, then chunks.
         let mut frames: Vec<Frame> = Vec::new();
         frames.push(
             encode(&ServerMessage::Welcome {
@@ -301,6 +335,23 @@ impl Sim {
                 time: self.world.time,
                 day: self.world.day,
                 flags: self.world.flags,
+            })
+            .into(),
+        );
+        // Own-id placement: `Welcome` carries only the world spawn, but a
+        // token reclaim restores the player's previous position (and the
+        // chunk window streams around it). Without this frame the client
+        // would predict from the spawn it placed itself at — frozen forever
+        // on a far reclaim because the spawn chunk never streams. The client
+        // snaps to any own-id `PlayerMoved` that disagrees by > 1 tile, so
+        // this is a no-op on a fresh spawn (identical placement formula).
+        frames.push(
+            encode(&ServerMessage::PlayerMoved {
+                id,
+                pos,
+                vel: (0.0, 0.0),
+                facing: 1,
+                anim: 0,
             })
             .into(),
         );
@@ -344,8 +395,17 @@ impl Sim {
         self.player_count
             .store(self.players.len(), Ordering::Relaxed);
         self.update_player_chunks(id);
-        let _ = reply.send(Ok(id));
+        let _ = reply.send(Ok((id, epoch)));
         tracing::info!(player = id, name = %name, "player joined");
+    }
+
+    /// A session's socket closed. Only removes the player when `epoch`
+    /// still matches: a kicked session's late Disconnect must not boot the
+    /// successor session that reclaimed the same id in the meantime.
+    fn disconnect(&mut self, id: u32, epoch: u64) {
+        if self.players.get(&id).is_some_and(|p| p.epoch == epoch) {
+            self.remove_player(id);
+        }
     }
 
     /// Removes a player, parks their state for re-join, tells everyone else.
@@ -385,9 +445,9 @@ impl Sim {
 
     /// THE dispatch point for client messages. Later feature PRs (mining,
     /// placing, combat, inventory, NPCs) add one arm per intent here.
-    fn handle_message(&mut self, id: u32, msg: ClientMessage) {
-        if !self.players.contains_key(&id) {
-            return; // message raced a disconnect
+    fn handle_message(&mut self, id: u32, epoch: u64, msg: ClientMessage) {
+        if !self.players.get(&id).is_some_and(|p| p.epoch == epoch) {
+            return; // message raced a disconnect, or is from a stale session
         }
         match msg {
             // The session layer consumed the real Hello; a duplicate is a
@@ -411,20 +471,24 @@ impl Sim {
     }
 
     /// Client-authoritative movement intake with sanity clamps
-    /// (ARCHITECTURE.md "Authority model").
+    /// (ARCHITECTURE.md "Authority model"). Displacement draws from a
+    /// banked per-player budget rather than `ticks since last state`, so N
+    /// `PlayerState`s processed within one tick share one allowance instead
+    /// of each minting a fresh [`MAX_TELEPORT_PER_TICK`].
     fn player_state(&mut self, id: u32, pos: (f32, f32), vel: (f32, f32), facing: i8, anim: u8) {
         let (w, h) = (self.world.width as f32, self.world.height as f32);
         let Some(p) = self.players.get_mut(&id) else {
             return;
         };
-        let ticks_elapsed = self.tick.saturating_sub(p.last_state_tick).max(1);
+        let ticks_elapsed = self.tick.saturating_sub(p.last_state_tick);
         p.last_state_tick = self.tick;
+        p.move_budget = (p.move_budget + ticks_elapsed as f32 * MAX_TELEPORT_PER_TICK)
+            .min(MAX_TELEPORT_BUDGET_TILES);
 
         let finite =
             pos.0.is_finite() && pos.1.is_finite() && vel.0.is_finite() && vel.1.is_finite();
-        let max_dist = MAX_TELEPORT_PER_TICK * ticks_elapsed as f32;
         let (dx, dy) = (pos.0 - p.pos.0, pos.1 - p.pos.1);
-        if !finite || dx * dx + dy * dy > max_dist * max_dist {
+        if !finite || dx * dx + dy * dy > p.move_budget * p.move_budget {
             // Teleport/garbage: keep the server position and snap the client
             // back with an authoritative own-id correction.
             tracing::debug!(player = id, ?pos, "rejected player state; snapping back");
@@ -438,6 +502,7 @@ impl Sim {
             self.send_to(id, &correction);
             return;
         }
+        p.move_budget -= (dx * dx + dy * dy).sqrt();
         p.pos = (
             pos.0.clamp(0.0, (w - PLAYER_WIDTH).max(0.0)),
             pos.1.clamp(0.0, (h - PLAYER_HEIGHT).max(0.0)),
@@ -746,17 +811,23 @@ mod tests {
         Sim::new(world, Arc::new(AtomicUsize::new(0)))
     }
 
-    /// Joins a player, returning their id and the outbound frame receiver.
-    fn join(sim: &mut Sim, name: &str, token: Option<AuthToken>) -> (u32, mpsc::Receiver<Frame>) {
-        let (id, rx) = try_join(sim, name, token);
-        (id.expect("join accepted"), rx)
+    /// Joins a player, returning their id, session epoch, and the outbound
+    /// frame receiver.
+    fn join(
+        sim: &mut Sim,
+        name: &str,
+        token: Option<AuthToken>,
+    ) -> (u32, u64, mpsc::Receiver<Frame>) {
+        let (reply, rx) = try_join(sim, name, token);
+        let (id, epoch) = reply.expect("join accepted");
+        (id, epoch, rx)
     }
 
     fn try_join(
         sim: &mut Sim,
         name: &str,
         token: Option<AuthToken>,
-    ) -> (Result<u32, String>, mpsc::Receiver<Frame>) {
+    ) -> (Result<(u32, u64), String>, mpsc::Receiver<Frame>) {
         let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE_FRAMES);
         let (reply_tx, mut reply_rx) = oneshot::channel();
         sim.handle(SimCommand::Join {
@@ -766,6 +837,15 @@ mod tests {
             reply: reply_tx,
         });
         (reply_rx.try_recv().expect("sim replied"), rx)
+    }
+
+    /// Shorthand for an in-game message from a live session.
+    fn msg(sim: &mut Sim, player_id: u32, epoch: u64, msg: ClientMessage) {
+        sim.handle(SimCommand::Message {
+            player_id,
+            epoch,
+            msg,
+        });
     }
 
     fn drain(rx: &mut mpsc::Receiver<Frame>) -> Vec<ServerMessage> {
@@ -779,7 +859,7 @@ mod tests {
     #[test]
     fn join_sends_welcome_inventory_time_and_chunks() {
         let mut sim = test_sim();
-        let (id, mut rx) = join(&mut sim, "alice", None);
+        let (id, _epoch, mut rx) = join(&mut sim, "alice", None);
         let msgs = drain(&mut rx);
         let ServerMessage::Welcome {
             player_id,
@@ -793,6 +873,16 @@ mod tests {
         assert_eq!(*player_id, id);
         assert_eq!(*spawn, (160, 100));
         assert_eq!(*time, NEW_WORLD_TIME);
+        // Authoritative own placement directly after Welcome (the client
+        // adopts it on reconnect reclaim).
+        let ServerMessage::PlayerMoved {
+            id: moved_id, pos, ..
+        } = &msgs[1]
+        else {
+            panic!("second frame must be the own-id placement: {:?}", msgs[1]);
+        };
+        assert_eq!(*moved_id, id);
+        assert_eq!(*pos, sim.players[&id].pos);
         let inv = msgs.iter().find_map(|m| match m {
             ServerMessage::InventorySync { slots } => Some(slots.clone()),
             _ => None,
@@ -815,7 +905,7 @@ mod tests {
     #[test]
     fn rejects_dupes_imposters_and_a_full_server() {
         let mut sim = test_sim();
-        let (_, _rx) = join(&mut sim, "alice", None);
+        let (_, _, _rx) = join(&mut sim, "alice", None);
         let (dupe, _rx2) = try_join(&mut sim, "alice", None);
         assert!(dupe.is_err(), "duplicate name must be rejected");
         let (bad_name, _rx3) = try_join(&mut sim, "  \u{7} ", None);
@@ -834,56 +924,121 @@ mod tests {
     #[test]
     fn token_reclaims_identity_and_blocks_imposters() {
         let mut sim = test_sim();
-        let (id, mut rx) = join(&mut sim, "alice", None);
+        let (id, epoch, mut rx) = join(&mut sim, "alice", None);
         let msgs = drain(&mut rx);
         let &ServerMessage::Welcome { token, .. } = &msgs[0] else {
             panic!("welcome");
         };
         // Move alice somewhere, then disconnect.
-        sim.handle(SimCommand::Message {
-            player_id: id,
-            msg: ClientMessage::PlayerState {
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::PlayerState {
                 pos: (165.0, 95.0),
                 vel: (0.0, 0.0),
                 facing: -1,
                 anim: 0,
             },
+        );
+        sim.handle(SimCommand::Disconnect {
+            player_id: id,
+            epoch,
         });
-        sim.handle(SimCommand::Disconnect { player_id: id });
         assert!(sim.players.is_empty());
 
         // Wrong token: rejected. Right token: same id, position restored.
         let (imposter, _rx) = try_join(&mut sim, "alice", Some([0xee; 16]));
         assert!(imposter.is_err());
-        let (re_id, mut rx) = join(&mut sim, "alice", Some(token));
+        let (re_id, _, mut rx) = join(&mut sim, "alice", Some(token));
         assert_eq!(re_id, id, "identity reclaimed");
         let msgs = drain(&mut rx);
-        let moved_back = msgs
+        assert!(msgs
             .iter()
-            .any(|m| matches!(m, ServerMessage::Welcome { .. }));
-        assert!(moved_back);
+            .any(|m| matches!(m, ServerMessage::Welcome { .. })));
         assert_eq!(sim.players[&re_id].pos, (165.0, 95.0));
+        // The reclaimed position is pushed to the client as an own-id
+        // correction right after Welcome — otherwise the client would
+        // predict from the world spawn and desync (or freeze, far away).
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, ServerMessage::PlayerMoved { id, pos, .. }
+                    if *id == re_id && *pos == (165.0, 95.0))),
+            "own-position frame in the reclaim join state: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn stale_session_commands_cannot_touch_a_reclaimed_session() {
+        let mut sim = test_sim();
+        let (id, old_epoch, mut rx) = join(&mut sim, "alice", None);
+        let msgs = drain(&mut rx);
+        let &ServerMessage::Welcome { token, .. } = &msgs[0] else {
+            panic!("welcome");
+        };
+        // Session 1 is dropped (kick or disconnect) and alice reclaims her
+        // identity with a new session reusing the same player id.
+        sim.handle(SimCommand::Disconnect {
+            player_id: id,
+            epoch: old_epoch,
+        });
+        let (re_id, new_epoch, mut rx2) = join(&mut sim, "alice", Some(token));
+        assert_eq!(re_id, id, "same id reused — the hazard under test");
+        assert_ne!(old_epoch, new_epoch);
+
+        // Session 1's pump finally ends and sends its (now stale)
+        // Disconnect: the live session must survive.
+        sim.handle(SimCommand::Disconnect {
+            player_id: id,
+            epoch: old_epoch,
+        });
+        assert!(
+            sim.players.contains_key(&id),
+            "stale Disconnect must not remove the reclaimed live session"
+        );
+
+        // Stale in-game messages are ignored too.
+        drain(&mut rx2);
+        msg(
+            &mut sim,
+            id,
+            old_epoch,
+            ClientMessage::Chat { text: "boo".into() },
+        );
+        assert!(
+            drain(&mut rx2).is_empty(),
+            "stale-session chat must be dropped"
+        );
+
+        // The live epoch still works normally.
+        sim.handle(SimCommand::Disconnect {
+            player_id: id,
+            epoch: new_epoch,
+        });
+        assert!(sim.players.is_empty(), "live Disconnect still removes");
     }
 
     #[test]
     fn movement_is_clamped_and_rebroadcast_every_three_ticks() {
         let mut sim = test_sim();
-        let (a, mut rx_a) = join(&mut sim, "alice", None);
-        let (b, mut rx_b) = join(&mut sim, "bob", None);
+        let (a, a_epoch, mut rx_a) = join(&mut sim, "alice", None);
+        let (b, b_epoch, mut rx_b) = join(&mut sim, "bob", None);
         drain(&mut rx_a);
         drain(&mut rx_b);
 
         let start = sim.players[&b].pos;
         let target = (start.0 + 3.0, start.1 - 1.0);
-        sim.handle(SimCommand::Message {
-            player_id: b,
-            msg: ClientMessage::PlayerState {
+        msg(
+            &mut sim,
+            b,
+            b_epoch,
+            ClientMessage::PlayerState {
                 pos: target,
                 vel: (60.0, 0.0), // over MAX_PLAYER_SPEED → clamped
                 facing: 1,
                 anim: 0,
             },
-        });
+        );
         for _ in 0..SNAPSHOT_INTERVAL_TICKS {
             sim.tick();
         }
@@ -902,15 +1057,17 @@ mod tests {
             .any(|m| matches!(m, ServerMessage::PlayerMoved { id, .. } if *id == b)));
 
         // Teleporting far snaps back: position unchanged + own-id correction.
-        sim.handle(SimCommand::Message {
-            player_id: b,
-            msg: ClientMessage::PlayerState {
+        msg(
+            &mut sim,
+            b,
+            b_epoch,
+            ClientMessage::PlayerState {
                 pos: (target.0 + 200.0, target.1),
                 vel: (0.0, 0.0),
                 facing: 1,
                 anim: 0,
             },
-        });
+        );
         assert_eq!(sim.players[&b].pos, target, "teleport rejected");
         let correction = drain(&mut rx_b);
         assert!(
@@ -921,28 +1078,116 @@ mod tests {
             "snap-back correction sent to the offender: {correction:?}"
         );
         // NaN states are rejected too.
-        sim.handle(SimCommand::Message {
-            player_id: a,
-            msg: ClientMessage::PlayerState {
+        msg(
+            &mut sim,
+            a,
+            a_epoch,
+            ClientMessage::PlayerState {
                 pos: (f32::NAN, 0.0),
                 vel: (0.0, 0.0),
                 facing: 1,
                 anim: 0,
             },
-        });
+        );
         assert!(sim.players[&a].pos.0.is_finite());
+    }
+
+    /// Regression: N `PlayerState`s arriving within one tick used to each
+    /// mint a fresh MAX_TELEPORT_PER_TICK allowance (`ticks_elapsed.max(1)`
+    /// after `last_state_tick` was refreshed mid-tick), letting a client hop
+    /// N×30 tiles per tick. Stacked states now share one banked budget.
+    #[test]
+    fn same_tick_state_stacking_shares_one_teleport_budget() {
+        let mut sim = test_sim();
+        let (id, epoch, mut rx) = join(&mut sim, "alice", None);
+        drain(&mut rx);
+        let start = sim.players[&id].pos;
+
+        // 5 stacked hops of 29 tiles each, no tick in between: only the
+        // first fits the budget; the rest are rejected with corrections.
+        for i in 1..=5 {
+            msg(
+                &mut sim,
+                id,
+                epoch,
+                ClientMessage::PlayerState {
+                    pos: (start.0 + 29.0 * i as f32, start.1),
+                    vel: (0.0, 0.0),
+                    facing: 1,
+                    anim: 0,
+                },
+            );
+        }
+        let moved = sim.players[&id].pos.0 - start.0;
+        assert!(
+            moved <= MAX_TELEPORT_PER_TICK,
+            "stacked states moved {moved} tiles in one tick"
+        );
+        let corrections = drain(&mut rx)
+            .iter()
+            .filter(|m| matches!(m, ServerMessage::PlayerMoved { id: mid, .. } if *mid == id))
+            .count();
+        assert_eq!(corrections, 4, "each rejected hop snaps the client back");
+
+        // Budget replenishes with elapsed ticks: normal movement resumes.
+        for _ in 0..SNAPSHOT_INTERVAL_TICKS {
+            sim.tick();
+        }
+        let here = sim.players[&id].pos;
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::PlayerState {
+                pos: (here.0 + 2.0, here.1),
+                vel: (0.0, 0.0),
+                facing: 1,
+                anim: 0,
+            },
+        );
+        assert_eq!(sim.players[&id].pos.0, here.0 + 2.0, "legit move accepted");
+    }
+
+    /// The banked budget is capped: going quiet for a long time must not
+    /// bank a map-wide teleport.
+    #[test]
+    fn teleport_budget_is_capped_after_long_silence() {
+        let mut world = World::new(1200, 320);
+        world.spawn = (160, 100);
+        let mut sim = Sim::new(world, Arc::new(AtomicUsize::new(0)));
+        let (id, epoch, mut rx) = join(&mut sim, "alice", None);
+        drain(&mut rx);
+        // Bank far more ticks than the cap is worth.
+        let cap_ticks = (MAX_TELEPORT_BUDGET_TILES / MAX_TELEPORT_PER_TICK) as u32;
+        for _ in 0..cap_ticks * 10 {
+            sim.tick();
+        }
+        let start = sim.players[&id].pos;
+        msg(
+            &mut sim,
+            id,
+            epoch,
+            ClientMessage::PlayerState {
+                pos: (start.0 + MAX_TELEPORT_BUDGET_TILES + 10.0, start.1),
+                vel: (0.0, 0.0),
+                facing: 1,
+                anim: 0,
+            },
+        );
+        assert_eq!(
+            sim.players[&id].pos,
+            start,
+            "jump beyond the budget cap rejected even after long silence"
+        );
     }
 
     #[test]
     fn select_slot_broadcasts_held_item() {
         let mut sim = test_sim();
-        let (b, mut rx_b) = join(&mut sim, "bob", None);
-        let (_a, mut rx_a) = join(&mut sim, "alice", None);
+        let (b, b_epoch, mut rx_b) = join(&mut sim, "bob", None);
+        let (_a, _, mut rx_a) = join(&mut sim, "alice", None);
         drain(&mut rx_a);
-        sim.handle(SimCommand::Message {
-            player_id: b,
-            msg: ClientMessage::SelectSlot { slot: 1 },
-        });
+        msg(&mut sim, b, b_epoch, ClientMessage::SelectSlot { slot: 1 });
         let held = drain(&mut rx_a)
             .into_iter()
             .find_map(|m| match m {
@@ -952,10 +1197,7 @@ mod tests {
             .expect("held item broadcast");
         assert_eq!(held, (1, Some(ItemId::WoodPickaxe)));
         // Out-of-hotbar slots are ignored.
-        sim.handle(SimCommand::Message {
-            player_id: b,
-            msg: ClientMessage::SelectSlot { slot: 10 },
-        });
+        msg(&mut sim, b, b_epoch, ClientMessage::SelectSlot { slot: 10 });
         assert_eq!(sim.players[&b].held_slot, 1);
         drain(&mut rx_b);
     }
@@ -963,15 +1205,12 @@ mod tests {
     #[test]
     fn chat_is_sanitized_and_relayed() {
         let mut sim = test_sim();
-        let (a, mut rx_a) = join(&mut sim, "alice", None);
-        let (_b, mut rx_b) = join(&mut sim, "bob", None);
+        let (a, a_epoch, mut rx_a) = join(&mut sim, "alice", None);
+        let (_b, _, mut rx_b) = join(&mut sim, "bob", None);
         drain(&mut rx_a);
         drain(&mut rx_b);
         let long = format!("  \u{1}hi\u{7} {}", "x".repeat(300));
-        sim.handle(SimCommand::Message {
-            player_id: a,
-            msg: ClientMessage::Chat { text: long },
-        });
+        msg(&mut sim, a, a_epoch, ClientMessage::Chat { text: long });
         for rx in [&mut rx_a, &mut rx_b] {
             let chat = drain(rx)
                 .into_iter()
@@ -985,24 +1224,23 @@ mod tests {
             assert_eq!(chat.1.chars().count(), CHAT_MAX_CHARS);
         }
         // Whitespace-only chat is dropped.
-        sim.handle(SimCommand::Message {
-            player_id: a,
-            msg: ClientMessage::Chat {
+        msg(
+            &mut sim,
+            a,
+            a_epoch,
+            ClientMessage::Chat {
                 text: "  \n ".into(),
             },
-        });
+        );
         assert!(drain(&mut rx_b).is_empty());
     }
 
     #[test]
     fn ping_pong_and_time_advance() {
         let mut sim = test_sim();
-        let (a, mut rx_a) = join(&mut sim, "alice", None);
+        let (a, a_epoch, mut rx_a) = join(&mut sim, "alice", None);
         drain(&mut rx_a);
-        sim.handle(SimCommand::Message {
-            player_id: a,
-            msg: ClientMessage::Ping { nonce: 99 },
-        });
+        msg(&mut sim, a, a_epoch, ClientMessage::Ping { nonce: 99 });
         assert!(drain(&mut rx_a)
             .iter()
             .any(|m| matches!(m, ServerMessage::Pong { nonce: 99 })));
@@ -1030,7 +1268,7 @@ mod tests {
     fn change_tile_invalidates_cache_and_notifies_subscribers() {
         use ferraria_shared::tiles::TileId;
         let mut sim = test_sim();
-        let (_a, mut rx_a) = join(&mut sim, "alice", None);
+        let (_a, _, mut rx_a) = join(&mut sim, "alice", None);
         drain(&mut rx_a);
         // Spawn (160, 100) → chunk (2, 1) is subscribed.
         let (x, y) = (160, 100);
@@ -1050,20 +1288,27 @@ mod tests {
     #[test]
     fn chunk_hysteresis_avoids_resubscribe_thrash() {
         let mut sim = test_sim();
-        let (a, mut rx_a) = join(&mut sim, "alice", None);
+        let (a, a_epoch, mut rx_a) = join(&mut sim, "alice", None);
         drain(&mut rx_a);
         let base = sim.players[&a].chunks.clone();
-        // Step just over the chunk border (x: 160 → 193): window shifts right.
+        // Bank a little movement budget, then step just over the chunk
+        // border (x: ~160 → 193): the subscription window shifts right.
+        for _ in 0..SNAPSHOT_INTERVAL_TICKS {
+            sim.tick();
+        }
         let pos = sim.players[&a].pos;
-        sim.handle(SimCommand::Message {
-            player_id: a,
-            msg: ClientMessage::PlayerState {
+        msg(
+            &mut sim,
+            a,
+            a_epoch,
+            ClientMessage::PlayerState {
                 pos: (193.0, pos.1),
                 vel: (0.0, 0.0),
                 facing: 1,
                 anim: 0,
             },
-        });
+        );
+        assert_eq!(sim.players[&a].pos.0, 193.0, "border step accepted");
         for _ in 0..SNAPSHOT_INTERVAL_TICKS {
             sim.tick();
         }
@@ -1071,15 +1316,17 @@ mod tests {
         // Hysteresis: the old left-edge chunks stay subscribed (within +1).
         assert!(after.is_superset(&base), "{base:?} -> {after:?}");
         // Walking back doesn't resend anything.
-        sim.handle(SimCommand::Message {
-            player_id: a,
-            msg: ClientMessage::PlayerState {
+        msg(
+            &mut sim,
+            a,
+            a_epoch,
+            ClientMessage::PlayerState {
                 pos,
                 vel: (0.0, 0.0),
                 facing: 1,
                 anim: 0,
             },
-        });
+        );
         drain(&mut rx_a);
         for _ in 0..SNAPSHOT_INTERVAL_TICKS {
             sim.tick();

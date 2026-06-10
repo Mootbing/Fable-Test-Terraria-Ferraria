@@ -49,6 +49,15 @@ pub const MAX_PLAYER_SPEED: f32 = 50.0;
 /// since its last accepted state is rejected and snapped back.
 pub const MAX_TELEPORT_PER_TICK: f32 = 30.0;
 
+/// Cap on the banked movement allowance behind the teleport clamp. Accepted
+/// displacement draws from a per-player budget that refills at
+/// [`MAX_TELEPORT_PER_TICK`] per elapsed sim tick but never exceeds this, so
+/// stacking many `PlayerState` messages into one tick (or going quiet for a
+/// long time first) can never multiply the clamp into a map-wide teleport.
+/// 10 ticks of allowance covers any legitimate burst: real movement tops out
+/// at terminal velocity (37.5 t/s ≈ 0.6 tiles/tick).
+pub const MAX_TELEPORT_BUDGET_TILES: f32 = MAX_TELEPORT_PER_TICK * 10.0;
+
 /// Player movement (`PlayerMoved`) and entity snapshots are rebroadcast every
 /// 3 ticks (20/s).
 pub const SNAPSHOT_INTERVAL_TICKS: u32 = 3;

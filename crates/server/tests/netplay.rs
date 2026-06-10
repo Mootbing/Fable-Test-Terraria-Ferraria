@@ -122,6 +122,7 @@ async fn connect_spawn_walk_chat_leave() {
     let mut chunks = 0u32;
     let mut inv: Option<Vec<Option<InvSlot>>> = None;
     let mut time = false;
+    let mut own_pos: Option<(f32, f32)> = None;
     while chunks == 0 || inv.is_none() || !time {
         match recv(&mut a).await {
             ServerMessage::ChunkData { bytes, .. } => {
@@ -130,9 +131,16 @@ async fn connect_spawn_walk_chat_leave() {
             }
             ServerMessage::InventorySync { slots } => inv = Some(slots),
             ServerMessage::TimeSync { .. } => time = true,
+            // Authoritative own placement (used by reconnect reclaim).
+            ServerMessage::PlayerMoved { id, pos, .. } if id == a_id => own_pos = Some(pos),
             other => panic!("unexpected join frame {other:?}"),
         }
     }
+    let own_pos = own_pos.expect("own placement frame sent with the join state");
+    assert!(
+        (own_pos.0 - spawn.0 as f32).abs() < 3.0 && (own_pos.1 - spawn.1 as f32).abs() < 4.0,
+        "fresh join placement is at the world spawn {spawn:?}, got {own_pos:?}"
+    );
     let inv = inv.expect("inventory synced");
     assert_eq!(inv.len(), inventory::TOTAL);
     for (i, kit) in STARTING_KIT.iter().enumerate() {
@@ -197,6 +205,91 @@ async fn connect_spawn_walk_chat_leave() {
         _ => None,
     })
     .await;
+}
+
+/// Regression for the reconnect-reclaim desync: the server restores the old
+/// position on a token reclaim and must push it to the client as an own-id
+/// `PlayerMoved` in the join state — otherwise the client predicts from the
+/// world spawn (frozen forever if the spawn chunk isn't streamed).
+#[tokio::test]
+async fn token_reclaim_restores_position_after_reconnect() {
+    let port = start_server().await;
+    let mut ws = connect(port).await;
+    send(
+        &mut ws,
+        &ClientMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            name: "carol".into(),
+            token: None,
+        },
+    )
+    .await;
+    let (player_id, token, spawn) = match recv(&mut ws).await {
+        ServerMessage::Welcome {
+            player_id,
+            token,
+            spawn,
+            ..
+        } => (player_id, token, spawn),
+        other => panic!("expected Welcome, got {other:?}"),
+    };
+
+    // Walk a few tiles away, then use a Ping barrier to be sure the sim has
+    // applied the movement (commands are processed in order).
+    let dest = (spawn.0 as f32 + 5.0, spawn.1 as f32 - 3.0);
+    send(
+        &mut ws,
+        &ClientMessage::PlayerState {
+            pos: dest,
+            vel: (0.0, 0.0),
+            facing: 1,
+            anim: 0,
+        },
+    )
+    .await;
+    send(&mut ws, &ClientMessage::Ping { nonce: 7 }).await;
+    expect(&mut ws, "Pong", |m| match m {
+        ServerMessage::Pong { nonce: 7 } => Some(()),
+        _ => None,
+    })
+    .await;
+    ws.close(None).await.expect("close");
+
+    // Wait for the server to process the disconnect (frees the name).
+    let mut freed = false;
+    for _ in 0..50 {
+        if http_get(port, "/api/status").await.contains("\"players\":0") {
+            freed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(freed, "session released after close");
+
+    // Reconnect with the token: same id, and the join state must carry the
+    // reclaimed position as an own-id PlayerMoved.
+    let mut ws2 = connect(port).await;
+    send(
+        &mut ws2,
+        &ClientMessage::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            name: "carol".into(),
+            token: Some(token),
+        },
+    )
+    .await;
+    match recv(&mut ws2).await {
+        ServerMessage::Welcome { player_id: id, .. } => {
+            assert_eq!(id, player_id, "identity reclaimed")
+        }
+        other => panic!("expected Welcome, got {other:?}"),
+    }
+    let restored = expect(&mut ws2, "own-id placement", |m| match m {
+        ServerMessage::PlayerMoved { id, pos, .. } if id == player_id => Some(pos),
+        _ => None,
+    })
+    .await;
+    assert_eq!(restored, dest, "reclaimed position pushed to the client");
 }
 
 #[tokio::test]
