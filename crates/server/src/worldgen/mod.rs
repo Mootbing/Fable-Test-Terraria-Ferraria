@@ -83,7 +83,8 @@ pub struct GenParams {
     /// floor band).
     pub hell_ceiling_rows: (u32, u32),
     pub hell_floor_rows: (u32, u32),
-    /// Open tiles at/below this row become lava.
+    /// Open tiles strictly below this row become lava (§1.2 4c: "below row
+    /// 1100").
     pub hell_lava_row: u32,
     pub hell_noise_wavelength: f32,
     // Pass 5.
@@ -164,7 +165,7 @@ impl GenParams {
             blob_strength: (6.0, 14.0),
             blob_steps: (6, 12),
             clay_blobs: count(300),
-            clay_rows: (row(250), row(500)),
+            clay_rows: rows(250, 500),
             clay_strength: (4.0, 9.0),
             clay_steps: (4, 8),
             surface_worms: count(80),
@@ -172,7 +173,7 @@ impl GenParams {
             surface_worm_steps: (15, 30),
             surface_worm_bias_y: 0.3,
             cavern_worms: count(250),
-            cavern_worm_rows: (row(450), row(980)),
+            cavern_worm_rows: rows(450, 980),
             cavern_worm_strength: (10.0, 22.0),
             cavern_worm_steps: (60, 100),
             hell_ceiling_rows: (row(1020), row(1050)),

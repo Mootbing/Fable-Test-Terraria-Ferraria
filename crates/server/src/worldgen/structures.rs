@@ -77,10 +77,13 @@ fn underground_chests(world: &mut World, params: &GenParams, rng: &mut Pcg32) {
     let spacing_sq = (params.chest_spacing * params.chest_spacing) as u64;
     let (cw, ch) = (2, 2);
     'outer: for _ in 0..params.underground_chests {
-        for _ in 0..TRIES_PER_PLACEMENT / 50 {
+        // Generous retry budget: a single find_floor_spot scan misses a few
+        // percent of the time and the spacing rule rejects more — the §1.2
+        // table asks for the full 150, so rescan instead of abandoning.
+        for _ in 0..TRIES_PER_PLACEMENT / 5 {
             let Some((x, y)) = find_floor_spot(world, rng, params.underground_chest_rows, cw, ch)
             else {
-                continue 'outer;
+                continue;
             };
             let far_enough = placed.iter().all(|&(px, py)| {
                 let dx = px.abs_diff(x) as u64;
@@ -260,7 +263,7 @@ fn life_crystals(world: &mut World, params: &GenParams, rng: &mut Pcg32) {
 /// 600 pots on cave floors in every layer (below the surface, lava-free).
 fn pots(world: &mut World, params: &GenParams, rng: &mut Pcg32, surface: &[u32]) {
     'outer: for _ in 0..params.pots {
-        for _ in 0..TRIES_PER_PLACEMENT {
+        for _ in 0..TRIES_PER_PLACEMENT * 4 {
             let x = rng.gen_range_u32(1..params.width - 1);
             let lo = surface[x as usize] + 1;
             if lo + 2 >= params.height {
@@ -320,8 +323,10 @@ fn cobwebs(world: &mut World, params: &GenParams, rng: &mut Pcg32, pockets: &Poc
         }
     }
 
-    // Top-up: clusters seeded in nooks of the open cave network.
-    let mut attempts = params.cobweb_target * 40;
+    // Top-up: clusters seeded in nooks of the open cave network. Nook seeds
+    // (≥4 of 8 neighbors solid) are rare among random picks, so the budget
+    // is deliberately large — this loop is what gets us to the spec's ~2000.
+    let mut attempts = params.cobweb_target * 250;
     while placed < params.cobweb_target && attempts > 0 {
         attempts -= 1;
         let x = rng.gen_range_u32(1..params.width - 1);

@@ -103,9 +103,12 @@ fn underground_chests_are_plentiful_and_looted() {
             (p.underground_chest_rows.0..p.underground_chest_rows.1).contains(&(y + 2))
         })
         .count();
+    // Placement is best-effort, but on seed 42 it reaches the full §1.2
+    // table; keep a small allowance so tuning other passes can't make the
+    // count silently collapse again.
     assert!(
-        underground >= 100,
-        "only {underground} underground chests (want >= 100 of {})",
+        underground as u32 >= p.underground_chests - 5,
+        "only {underground} underground chests (spec {})",
         p.underground_chests
     );
     // Every chest has loot and a real 2×2 chest at its origin.
@@ -267,13 +270,23 @@ fn life_crystals_pots_and_cobwebs_exist() {
     let p = params();
     let crystals = count_tiles(w, TileId::LifeCrystal);
     assert!(
-        crystals as u32 >= p.life_crystals / 2,
-        "only {crystals} life crystals"
+        crystals as u32 >= p.life_crystals - 5,
+        "only {crystals} life crystals (spec {})",
+        p.life_crystals
     );
+    // Spawn flattening (pass 12) may legitimately remove a few pots.
     let pots = count_tiles(w, TileId::Pot);
-    assert!(pots as u32 >= p.pots / 2, "only {pots} pots");
+    assert!(
+        pots as u32 >= p.pots - 10,
+        "only {pots} pots (spec {})",
+        p.pots
+    );
     let cobwebs = count_tiles(w, TileId::Cobweb);
-    assert!(cobwebs > 200, "only {cobwebs} cobwebs");
+    assert!(
+        cobwebs as u32 >= p.cobweb_target * 9 / 10,
+        "only {cobwebs} cobwebs (target {})",
+        p.cobweb_target
+    );
 }
 
 #[test]
@@ -384,6 +397,15 @@ fn stats() {
         println!("{id:?}: {}", count_tiles(w, id));
     }
     println!("chests: {}", w.chests.len());
+    let (mut surf, mut under, mut hell) = (0, 0, 0);
+    for &(_, y) in w.chests.keys() {
+        match y + 2 {
+            f if f < p.underground_chest_rows.0 => surf += 1,
+            f if f < p.stone_to_ash => under += 1,
+            _ => hell += 1,
+        }
+    }
+    println!("  surface: {surf}, underground: {under}, underworld: {hell}");
     let lava = w
         .tiles
         .iter()

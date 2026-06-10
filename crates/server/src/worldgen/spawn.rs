@@ -3,7 +3,7 @@
 //! a 10-tile window; that window is flattened into a platform and the spawn
 //! sits one tile above it.
 
-use ferraria_shared::tiles::{Tile, TileId};
+use ferraria_shared::tiles::{Liquid, Tile, TileId};
 use ferraria_shared::world::World;
 
 use super::caves::surface_scan;
@@ -70,6 +70,10 @@ pub fn pick_spawn(world: &mut World, params: &GenParams) {
         while y < params.height && !world.tile(x, y).is_solid() && filled < 30 {
             let mut t = world.tile(x, y);
             t.id = TileId::Dirt;
+            // Drop any settled liquid: a solid tile holding water/lava is a
+            // state the §3 automaton doesn't model (reachable at small world
+            // heights where the fill zone overlaps the water band).
+            t.liquid = Liquid::NONE;
             t.state = 0;
             world.set_tile(x, y, t);
             y += 1;

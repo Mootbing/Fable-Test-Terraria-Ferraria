@@ -68,8 +68,9 @@ pub fn fill_and_settle(world: &mut World, params: &GenParams, rng: &mut Pcg32) -
         }
     }
 
-    // Underworld lava lakes: every open tile below the lava line (§1.2 4c).
-    for y in params.hell_lava_row..params.height {
+    // Underworld lava lakes: every open tile strictly below the lava line
+    // (§1.2 4c: "below row 1100").
+    for y in params.hell_lava_row + 1..params.height {
         for x in 0..params.width {
             let idx = y as usize * w + x as usize;
             let t = &mut world.tiles[idx];
