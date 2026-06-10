@@ -37,7 +37,8 @@ engineering rules.
 - **Append new variants at the end of enums.** Renumbering breaks postcard
   compatibility; bump `PROTOCOL_VERSION` on any breaking change.
 - Chunks: 64x64 tiles, lz4-compressed (`lz4_flex`), pushed by the server for
-  the 3x3 chunk neighborhood around each player and on subscription change.
+  the 5x3 chunk neighborhood around each player (wider than tall because
+  screens are), with 1 chunk of hysteresis before unsubscribing.
 - Entity snapshots broadcast every 3 ticks (20/s). Tile changes broadcast
   immediately as deltas.
 

@@ -507,6 +507,15 @@ impl InvSlot {
     }
 }
 
+/// Starting kit (§8): Wood Sword, Wood Pickaxe, Wood Axe, 5 Torches. New
+/// players get these in hotbar slots 0..4.
+pub const STARTING_KIT: [InvSlot; 4] = [
+    InvSlot::new(ItemId::WoodSword, 1),
+    InvSlot::new(ItemId::WoodPickaxe, 1),
+    InvSlot::new(ItemId::WoodAxe, 1),
+    InvSlot::new(ItemId::Torch, 5),
+];
+
 /// Inventory layout (§8): hotbar 10 + backpack 40 + armor 3 + accessory 3 +
 /// trash 1 = 57 slots. Index helpers for the flat slot array.
 pub mod inventory {
@@ -531,6 +540,20 @@ mod tests {
         assert_eq!(ITEM_DATA.len(), ItemId::COUNT);
         for id in ItemId::ALL {
             assert!(!id.data().name.is_empty(), "{id:?} has no name");
+        }
+    }
+
+    #[test]
+    fn starting_kit_matches_design() {
+        // §8: Wood Sword, Wood Pickaxe, Wood Axe, 5 Torches.
+        assert_eq!(STARTING_KIT.len(), 4);
+        assert_eq!(STARTING_KIT[0], InvSlot::new(ItemId::WoodSword, 1));
+        assert_eq!(STARTING_KIT[1], InvSlot::new(ItemId::WoodPickaxe, 1));
+        assert_eq!(STARTING_KIT[2], InvSlot::new(ItemId::WoodAxe, 1));
+        assert_eq!(STARTING_KIT[3], InvSlot::new(ItemId::Torch, 5));
+        assert!(STARTING_KIT.len() <= inventory::HOTBAR);
+        for slot in STARTING_KIT {
+            assert!(slot.count <= slot.item.max_stack());
         }
     }
 
