@@ -15,9 +15,17 @@ use crate::tiles::{state, Liquid, Tile, TileId};
 pub const WORLD_WIDTH: u32 = 4200;
 pub const WORLD_HEIGHT: u32 = 1200;
 
-/// Chunks are 64×64 tiles; the server streams the 3×3 neighborhood around
-/// each player.
+/// Chunks are 64×64 tiles; the server streams the 5×3 neighborhood around
+/// each player (see the `CHUNK_SUB_*` constants).
 pub const CHUNK_SIZE: u32 = 64;
+
+/// Per-player chunk subscription window: ±2 chunks horizontally and ±1
+/// vertically (5×3 — wider than tall because screens are). A player
+/// unsubscribes from a chunk only once it falls [`CHUNK_SUB_HYSTERESIS`]
+/// chunks outside this window, so hovering on a boundary doesn't thrash.
+pub const CHUNK_SUB_RADIUS_X: u32 = 2;
+pub const CHUNK_SUB_RADIUS_Y: u32 = 1;
+pub const CHUNK_SUB_HYSTERESIS: u32 = 1;
 
 /// Chests have 40 slots (§2 tile 19).
 pub const CHEST_SLOTS: usize = 40;

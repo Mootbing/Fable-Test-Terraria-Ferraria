@@ -1,10 +1,38 @@
+//! The Ferraria browser client (wasm32 + macroquad).
+//!
+//! Module map:
+//! - [`net`] — WebSocket facade over the `web/quad_ws.js` plugin.
+//! - [`app`] — Menu → Connecting → Playing → Disconnected state machine and
+//!   the live `Session`.
+//! - [`world_view`] — mirror of the server world (chunks + tile deltas).
+//! - [`player`] — own-player prediction, remote-player interpolation.
+//! - [`render`] — camera, sky, tiles, player sprites.
+//! - [`ui`] — menus, HUD, chat, debug overlay.
+
+mod app;
+mod net;
+mod player;
+mod render;
+mod ui;
+mod world_view;
+
 use macroquad::prelude::*;
 
-#[macroquad::main("Ferraria")]
+fn conf() -> Conf {
+    Conf {
+        window_title: "Ferraria".to_string(),
+        window_width: 1280,
+        window_height: 720,
+        high_dpi: true,
+        ..Default::default()
+    }
+}
+
+#[macroquad::main(conf)]
 async fn main() {
+    let mut app = app::App::new();
     loop {
-        clear_background(Color::from_rgba(110, 170, 230, 255));
-        draw_text("Ferraria", 40.0, 60.0, 48.0, WHITE);
+        app.frame();
         next_frame().await;
     }
 }

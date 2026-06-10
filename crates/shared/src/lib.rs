@@ -35,6 +35,43 @@ pub const DT: f32 = 1.0 / TICK_RATE as f32;
 /// Players can mine/place/interact within this many tiles of their center.
 pub const REACH: f32 = 6.0;
 
+// ---- Netcode (ARCHITECTURE.md "Wire protocol" / "Authority model") ---------
+
+/// Hard cap on concurrently connected players; the server rejects further
+/// handshakes.
+pub const MAX_PLAYERS: usize = 16;
+
+/// Sanity clamp on client-reported velocity components (tiles/s). Generous —
+/// well above terminal velocity — so legit play never trips it.
+pub const MAX_PLAYER_SPEED: f32 = 50.0;
+
+/// A client-reported position that jumps more than this many tiles per tick
+/// since its last accepted state is rejected and snapped back.
+pub const MAX_TELEPORT_PER_TICK: f32 = 30.0;
+
+/// Cap on the banked movement allowance behind the teleport clamp. Accepted
+/// displacement draws from a per-player budget that refills at
+/// [`MAX_TELEPORT_PER_TICK`] per elapsed sim tick but never exceeds this, so
+/// stacking many `PlayerState` messages into one tick (or going quiet for a
+/// long time first) can never multiply the clamp into a map-wide teleport.
+/// 10 ticks of allowance covers any legitimate burst: real movement tops out
+/// at terminal velocity (37.5 t/s ≈ 0.6 tiles/tick).
+pub const MAX_TELEPORT_BUDGET_TILES: f32 = MAX_TELEPORT_PER_TICK * 10.0;
+
+/// Player movement (`PlayerMoved`) and entity snapshots are rebroadcast every
+/// 3 ticks (20/s).
+pub const SNAPSHOT_INTERVAL_TICKS: u32 = 3;
+
+/// `TimeSync` cadence: once per real second.
+pub const TIME_SYNC_INTERVAL_TICKS: u32 = 60;
+
+/// Chat messages are stripped of control characters, trimmed, and capped to
+/// this many characters.
+pub const CHAT_MAX_CHARS: usize = 200;
+
+/// Player names are trimmed and must be 1..=MAX_NAME_CHARS characters.
+pub const MAX_NAME_CHARS: usize = 16;
+
 /// A crafting station enables its recipes within this many tiles (§4.4) —
 /// deliberately shorter than [`REACH`].
 pub const STATION_RANGE: f32 = 4.0;
