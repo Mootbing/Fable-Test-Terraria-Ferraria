@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 use crate::items::{InvSlot, ItemId};
 
 /// Crafting stations (§4.4). A recipe is craftable when its station is
-/// within [`crate::REACH`] tiles ("Hands" is always available; "Bottle" is a
-/// bottle placed on a table/workbench — `tiles::state::BOTTLE_ON_TOP`).
+/// within [`crate::STATION_RANGE`] (4) tiles — note this is *not* the 6-tile
+/// mine/place [`crate::REACH`]. "Hands" is always available; "Bottle" is a
+/// bottle placed on a table/workbench — `tiles::state::BOTTLE_ON_TOP`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Station {

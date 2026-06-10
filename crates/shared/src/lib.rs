@@ -35,6 +35,10 @@ pub const DT: f32 = 1.0 / TICK_RATE as f32;
 /// Players can mine/place/interact within this many tiles of their center.
 pub const REACH: f32 = 6.0;
 
+/// A crafting station enables its recipes within this many tiles (§4.4) —
+/// deliberately shorter than [`REACH`].
+pub const STATION_RANGE: f32 = 4.0;
+
 /// Global cap on live hostile enemies (§0).
 pub const MAX_LIVE_ENEMIES: u32 = 200;
 
@@ -51,6 +55,34 @@ pub const CRIT_MULT: f32 = 2.0;
 pub const PLAYER_BASE_MAX_HP: u32 = 100;
 pub const LIFE_CRYSTAL_HP: u32 = 20;
 pub const PLAYER_MAX_MAX_HP: u32 = 400;
+
+/// Passive regen (§8): 0.5 HP/s once 8 s have passed without taking damage,
+/// doubled while standing still.
+pub const REGEN_HP_PER_SEC: f32 = 0.5;
+pub const REGEN_DELAY_SECS: f32 = 8.0;
+pub const REGEN_STANDING_STILL_MULT: f32 = 2.0;
+
+/// Breath (§8): 200 units; fully submerged it drains 1 unit every 7 ticks
+/// (≈23.3 s total); out of water it refills 3 units/tick (≈1.1 s). At 0
+/// breath the player takes 10 dmg/s, ignoring defense.
+pub const PLAYER_MAX_BREATH: u32 = 200;
+pub const BREATH_DRAIN_INTERVAL_TICKS: u32 = 7;
+pub const BREATH_REFILL_PER_TICK: u32 = 3;
+pub const DROWNING_DPS: u32 = 10;
+
+/// Death & respawn (§8): drop 50% of carried coins where you died (the pile
+/// persists 10 min); respawn after 10 s, or 20 s while any boss is alive.
+pub const DEATH_COIN_DROP_FRAC: f32 = 0.5;
+pub const DEATH_PILE_PERSIST_SECS: u32 = 600;
+pub const RESPAWN_SECS: u32 = 10;
+pub const RESPAWN_SECS_BOSS_ALIVE: u32 = 20;
+
+/// Debuff magnitudes (§8): Burning ticks 2 dmg/s ignoring defense; Darkness
+/// halves the client-computed light radius (§10). Durations are per-source
+/// (`tiles::LAVA_BURN_SECS`, `items::POTION_SICKNESS_SECS`, ...); kinds are
+/// `protocol::Debuff`.
+pub const BURNING_DPS: u32 = 2;
+pub const DARKNESS_LIGHT_RADIUS_MULT: f32 = 0.5;
 
 /// Coin denominations (§0): 100 Copper = 1 Silver, etc. Values in code are
 /// in copper coins (see `items::ItemData::value`).

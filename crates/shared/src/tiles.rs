@@ -100,7 +100,8 @@ pub struct TileData {
     pub breakable: bool,
     /// Furniture per §2 (✦).
     pub furniture: bool,
-    /// Crafting station provided when within reach (§4.4).
+    /// Crafting station provided when within `crate::STATION_RANGE` (4
+    /// tiles, §4.4).
     pub station: Option<Station>,
     /// Multi-tile footprint in tiles (w, h); `(1, 1)` for single tiles.
     pub size: (u8, u8),

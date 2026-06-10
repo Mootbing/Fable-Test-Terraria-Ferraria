@@ -436,6 +436,10 @@ pub fn step_player(
     // Vertical move.
     let dy = p.vel.1 * dt;
     let was_falling = p.vel.1 > 0.0;
+    // `landed` means a genuine airborne→grounded transition: while standing,
+    // gravity makes vel.1 > 0 every tick, so `was_falling` alone would
+    // re-report landing 60×/s (retriggering sounds/particles/Gust Jar).
+    let was_airborne = !p.on_ground;
     let (ny, hit_floor, hit_ceiling) = sweep_y(world, p.pos, size, dy, p.drop_through > 0.0);
     let fell = (ny - p.pos.1).max(0.0);
     p.pos.1 = ny;
@@ -450,7 +454,7 @@ pub fn step_player(
 
     p.on_ground = hit_floor;
     if hit_floor {
-        if was_falling {
+        if was_falling && was_airborne {
             out.landed = true;
             out.fall_distance = p.fall_distance;
         }
@@ -531,7 +535,7 @@ mod tests {
         for _ in 0..120 {
             let r = step_player(&world, &mut p, RIGHT, DT);
             assert!(p.on_ground, "stayed grounded while walking");
-            assert!(!r.landed || r.fall_distance == 0.0);
+            assert!(!r.landed, "landed must not re-fire while grounded");
         }
         assert_eq!(p.vel.0, RUN_MAX_SPEED, "reaches max run speed exactly");
         let moved = p.center().0 - start_x;
@@ -575,6 +579,22 @@ mod tests {
             tap_rise < rise / 2.0,
             "tap jump ({tap_rise}) much lower than full hold ({rise})"
         );
+    }
+
+    #[test]
+    fn landed_fires_exactly_once_per_fall() {
+        let world = flat_world();
+        let mut p = PlayerPhysics::new((5.0, 2.0)); // starts airborne
+        let mut landings = 0;
+        for _ in 0..240 {
+            let r = step_player(&world, &mut p, PlayerInput::default(), DT);
+            if r.landed {
+                landings += 1;
+                assert!(r.fall_distance > 0.0, "landing reports the real fall");
+            }
+        }
+        assert!(p.on_ground);
+        assert_eq!(landings, 1, "one fall, one landing event");
     }
 
     #[test]

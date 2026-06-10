@@ -178,7 +178,10 @@ impl World {
             for dx in 0..w {
                 let mut t = self.tile(x + dx, y + dy);
                 t.id = id;
-                t.state = state::part(dx as u8, dy as u8);
+                // Keep the WALL_PLACED bit: it describes the cell's *wall*
+                // (player-placed walls drop their item, §2), which placing
+                // furniture over must not reclassify as natural.
+                t.state = (t.state & state::WALL_PLACED) | state::part(dx as u8, dy as u8);
                 self.set_tile(x + dx, y + dy, t);
             }
         }
@@ -186,9 +189,14 @@ impl World {
     }
 
     /// Origin (top-left) of the multi-tile object covering `(x, y)`, derived
-    /// from the cell's frame byte. Returns `(x, y)` itself for 1×1 tiles.
+    /// from the cell's frame byte. Returns `(x, y)` itself for 1×1 tiles —
+    /// including ones whose state bits 0–4 carry a sprite variant instead of
+    /// a part offset (`state::GRASS_MUSHROOM`, tree segment kinds, ...).
     pub fn multitile_origin(&self, x: u32, y: u32) -> (u32, u32) {
         let t = self.tile(x, y);
+        if t.id.data().size == (1, 1) {
+            return (x, y);
+        }
         (
             x.saturating_sub(state::part_x(t.state) as u32),
             y.saturating_sub(state::part_y(t.state) as u32),
@@ -380,6 +388,51 @@ mod tests {
         assert!(w.place_multitile(20, 20, TileId::Torch));
         assert_eq!(w.tile(20, 20).wall, WallId::Stone);
         assert_eq!(w.tile(20, 20).liquid, Liquid::new(LiquidKind::Water, 4));
+    }
+
+    #[test]
+    fn place_multitile_keeps_wall_placed_bit() {
+        // Regression: placing furniture over a player-placed wall used to
+        // clear state::WALL_PLACED, reclassifying the wall as natural (so
+        // hammering it would wrongly drop nothing, §2).
+        let mut w = World::new(32, 32);
+        let mut cell = Tile::AIR;
+        cell.wall = WallId::Wood;
+        cell.state = state::WALL_PLACED;
+        w.set_tile(10, 10, cell);
+        w.set_tile(11, 10, cell);
+        assert!(w.place_multitile(10, 10, TileId::Workbench)); // 2×1
+        for dx in 0..2u32 {
+            let t = w.tile(10 + dx, 10);
+            assert_eq!(t.id, TileId::Workbench);
+            assert_ne!(t.state & state::WALL_PLACED, 0, "wall bit lost at dx={dx}");
+            assert_eq!(state::part_x(t.state) as u32, dx);
+            assert_eq!(state::part_y(t.state), 0);
+        }
+        // Cells without the bit don't gain it.
+        assert!(w.place_multitile(20, 20, TileId::Workbench));
+        assert_eq!(w.tile(20, 20).state & state::WALL_PLACED, 0);
+    }
+
+    #[test]
+    fn multitile_origin_ignores_sprite_variants_on_1x1_tiles() {
+        // Regression: state bits 0–2 double as sprite variants on 1×1 tiles
+        // (grass mushroom, tree-top); multitile_origin must not read them as
+        // part offsets.
+        let mut w = World::new(16, 16);
+        let mut grass = Tile::of(TileId::Grass);
+        grass.state = state::GRASS_MUSHROOM;
+        w.set_tile(5, 5, grass);
+        assert_eq!(w.multitile_origin(5, 5), (5, 5));
+
+        let mut top = Tile::of(TileId::TreeTrunk);
+        top.state = state::TREE_SEGMENT_TOP;
+        w.set_tile(7, 3, top);
+        assert_eq!(w.multitile_origin(7, 3), (7, 3));
+
+        // Real multi-tiles still resolve through their frame bytes.
+        assert!(w.place_multitile(9, 9, TileId::Bed));
+        assert_eq!(w.multitile_origin(12, 10), (9, 9));
     }
 
     #[test]

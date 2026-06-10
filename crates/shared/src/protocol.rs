@@ -4,10 +4,18 @@
 //! # Compatibility rules — read before editing
 //!
 //! **Every enum in this file is append-only from now on.** postcard encodes
-//! variants by index, so reordering, removing, or inserting variants (or
-//! struct fields) breaks every existing client. Add new variants/fields at
-//! the END only, and bump [`crate::PROTOCOL_VERSION`] for any breaking
-//! change.
+//! variants by index, so reordering, removing, or inserting variants breaks
+//! every existing client. New *enum variants* may be appended at the END —
+//! that is the only wire-compatible change, because old frames never carry
+//! the new index.
+//!
+//! **Struct fields are positional and NOT extensible**: appending a field to
+//! an existing struct or enum-variant payload makes decoders expect bytes
+//! that old peers never send (`UnexpectedEnd` → [`decode`] returns `None`).
+//! Adding, removing, or reordering fields anywhere is a breaking change and
+//! requires a new variant or a [`crate::PROTOCOL_VERSION`] bump so the
+//! handshake version gate actually fires. See the `append_compat_rules`
+//! test, which pins both behaviors.
 //!
 //! Authority model (ARCHITECTURE.md): clients send *intents*; the server
 //! validates (reach ≤ 6 tiles, item possession, ...) and broadcasts deltas.
@@ -62,7 +70,8 @@ pub enum EntityKind {
     Watcher,
     BoneWardenSkull,
     BoneWardenHand,
-    /// Arrow in flight (item kind rides in the spawn's `state`/drop).
+    /// Arrow in flight (the arrow item kind rides in
+    /// [`ServerMessage::EntitySpawn`]'s `state` byte, for drop recovery).
     ArrowProjectile,
     FlamingArrowProjectile,
     VoidSickleProjectile,
@@ -75,6 +84,30 @@ pub enum NpcKind {
     Sage,
     Merchant,
     Nurse,
+}
+
+/// Player debuffs (§8). Append-only. Clients need these: Darkness halves
+/// the client-computed light radius (§10), Potion Sickness gates the
+/// healing-item UI (§4.4), and the Nurse price preview counts active
+/// debuffs (§7.4). Magnitudes/durations live in `shared` constants
+/// ([`crate::BURNING_DPS`], [`crate::DARKNESS_LIGHT_RADIUS_MULT`],
+/// [`crate::items::POTION_SICKNESS_SECS`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Debuff {
+    /// 2 dmg/s, ignores defense.
+    Burning,
+    /// Light radius halved.
+    Darkness,
+    /// Cannot use another healing item.
+    PotionSickness,
+}
+
+/// One entry of a [`ServerMessage::PlayerDebuffs`] list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveDebuff {
+    pub debuff: Debuff,
+    /// Ticks until it wears off.
+    pub remaining_ticks: u32,
 }
 
 /// One entry of an [`ServerMessage::EntityUpdate`] batch.
@@ -203,6 +236,28 @@ pub enum ClientMessage {
     Chat {
         text: String,
     },
+    /// Select the held hotbar slot (0–9). Establishes "the held tool" for
+    /// `HitTile`/`HitWall`/melee swings and what remote clients render in
+    /// this player's hands (rebroadcast as [`ServerMessage::PlayerHeldItem`]).
+    SelectSlot {
+        slot: u8,
+    },
+    /// Sell `count` from inventory `slot` to a merchant — §7.3: the merchant
+    /// buys back any item at 20% of its base `ItemData::value`. Per-player
+    /// transaction (§11).
+    SellItem {
+        npc_id: u32,
+        slot: u8,
+        count: u16,
+    },
+    /// Sleep in the bed at (x, y) (§9: time passes ×5 while all players
+    /// sleep, night only). The server validates bed + reach + night.
+    Sleep {
+        x: u32,
+        y: u32,
+    },
+    /// Get out of bed (also implied by moving/taking damage, server-side).
+    WakeUp,
 }
 
 /// Server → client. **Append-only** (see module docs).
@@ -269,10 +324,16 @@ pub enum ServerMessage {
         id: u32,
         pos: (f32, f32),
     },
+    /// `vel` lets fast projectiles (arrows fly at 35 t/s, §4.1) render in
+    /// motion immediately instead of stalling until the next `EntityUpdate`
+    /// batch (up to 3 ticks / 50 ms later). `state` is the kind-specific
+    /// state byte (e.g. the arrow item kind for projectiles).
     EntitySpawn {
         id: u32,
         kind: EntityKind,
         pos: (f32, f32),
+        vel: (f32, f32),
+        state: u8,
     },
     /// Snapshot batch, broadcast every 3 ticks.
     EntityUpdate {
@@ -336,6 +397,28 @@ pub enum ServerMessage {
     /// Server-driven banner text ("You feel something watching you...").
     Toast {
         text: String,
+    },
+    /// Breath meter (§8, 0..=[`crate::PLAYER_MAX_BREATH`]). Sent to the
+    /// owning player while draining/refilling.
+    PlayerBreath {
+        id: u32,
+        breath: u16,
+    },
+    /// Full replacement list of a player's active debuffs (§8). Broadcast:
+    /// remote clients dim Darkness victims' light (§10), the own client
+    /// gates healing items on Potion Sickness (§4.4) and previews Nurse
+    /// pricing (§7.4).
+    PlayerDebuffs {
+        id: u32,
+        debuffs: Vec<ActiveDebuff>,
+    },
+    /// Which hotbar slot a player holds and the item in it (`None` = empty
+    /// hand). `item` is included because remote clients don't know other
+    /// players' inventories.
+    PlayerHeldItem {
+        id: u32,
+        slot: u8,
+        item: Option<ItemId>,
     },
 }
 
@@ -410,6 +493,14 @@ mod tests {
         roundtrip_client(ClientMessage::Chat {
             text: "hello world".into(),
         });
+        roundtrip_client(ClientMessage::SelectSlot { slot: 9 });
+        roundtrip_client(ClientMessage::SellItem {
+            npc_id: 2,
+            slot: 14,
+            count: 30,
+        });
+        roundtrip_client(ClientMessage::Sleep { x: 2105, y: 277 });
+        roundtrip_client(ClientMessage::WakeUp);
     }
 
     #[test]
@@ -459,6 +550,15 @@ mod tests {
             id: 77,
             kind: EntityKind::BoneWardenSkull,
             pos: (2100.0, 1100.0),
+            vel: (0.0, -10.0),
+            state: 0,
+        });
+        roundtrip_server(ServerMessage::EntitySpawn {
+            id: 78,
+            kind: EntityKind::ArrowProjectile,
+            pos: (10.0, 20.0),
+            vel: (35.0, 0.0),
+            state: ItemId::WoodenArrow as u8,
         });
         roundtrip_server(ServerMessage::EntityDespawn {
             id: 77,
@@ -481,6 +581,72 @@ mod tests {
         roundtrip_server(ServerMessage::Toast {
             text: "You feel something watching you...".into(),
         });
+        roundtrip_server(ServerMessage::PlayerBreath { id: 1, breath: 137 });
+        roundtrip_server(ServerMessage::PlayerDebuffs {
+            id: 1,
+            debuffs: vec![
+                ActiveDebuff {
+                    debuff: Debuff::Burning,
+                    remaining_ticks: 7 * crate::TICK_RATE,
+                },
+                ActiveDebuff {
+                    debuff: Debuff::PotionSickness,
+                    remaining_ticks: 60 * crate::TICK_RATE,
+                },
+            ],
+        });
+        roundtrip_server(ServerMessage::PlayerDebuffs {
+            id: 2,
+            debuffs: vec![], // all cleared
+        });
+        roundtrip_server(ServerMessage::PlayerHeldItem {
+            id: 1,
+            slot: 0,
+            item: Some(ItemId::WoodSword),
+        });
+        roundtrip_server(ServerMessage::PlayerHeldItem {
+            id: 1,
+            slot: 4,
+            item: None,
+        });
+    }
+
+    /// Pins the module-doc compatibility rules against postcard itself:
+    /// appending an enum *variant* is wire-compatible; appending a *field*
+    /// to an existing struct/variant payload is breaking.
+    #[test]
+    fn append_compat_rules() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        enum V1 {
+            A { x: u32 },
+            B,
+        }
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        enum V2 {
+            A { x: u32 },
+            B,
+            C { y: u8 }, // appended variant
+        }
+        // Old peer's frame decodes fine on the extended enum...
+        let old_frame = encode(&V1::A { x: 7 });
+        assert_eq!(decode::<V2>(&old_frame), Some(V2::A { x: 7 }));
+        // ...but a frame of the new variant is garbage to the old peer.
+        let new_frame = encode(&V2::C { y: 1 });
+        assert_eq!(decode::<V1>(&new_frame), None);
+
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct S1 {
+            a: u32,
+        }
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct S2 {
+            a: u32,
+            b: u8, // appended field — NOT compatible
+        }
+        // Fields are positional: the extended decoder hits UnexpectedEnd on
+        // an old frame. Appending fields requires a PROTOCOL_VERSION bump.
+        let old_frame = encode(&S1 { a: 7 });
+        assert_eq!(decode::<S2>(&old_frame), None);
     }
 
     #[test]
