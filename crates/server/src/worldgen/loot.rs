@@ -107,6 +107,35 @@ pub const POT_COIN_MULT_SURFACE: u16 = 1;
 pub const POT_COIN_MULT_CAVERN: u16 = 2;
 pub const POT_COIN_MULT_UNDERWORLD: u16 = 4;
 
+/// §2.3 pot coin depth multiplier for a pot at row `y` in a world of
+/// `height` rows: ×1 above the cavern band, ×2 in it, ×4 in the underworld.
+/// Band starts scale with world height exactly like `GenParams` scales rows
+/// (450/1200 and 1000/1200 of the §1.1 baselines).
+pub fn pot_coin_mult(y: u32, height: u32) -> u16 {
+    let row = |r: u64| -> u32 { ((r * height as u64) / super::BASE_HEIGHT as u64) as u32 };
+    if y >= row(1000) {
+        POT_COIN_MULT_UNDERWORLD
+    } else if y >= row(450) {
+        POT_COIN_MULT_CAVERN
+    } else {
+        POT_COIN_MULT_SURFACE
+    }
+}
+
+/// Rolls one pot break (§2.3): picks an entry by weight and scales the coin
+/// roll by `coin_mult` (see [`pot_coin_mult`]).
+pub fn roll_pot(rng: &mut Pcg32, coin_mult: u16) -> InvSlot {
+    let weights: Vec<u32> = POT_LOOT.iter().map(|&(_, w)| w).collect();
+    let i = rng
+        .pick_weighted(&weights)
+        .unwrap_or(0 /* table weights are non-zero; pinned by test */);
+    let mut slot = roll(rng, &POT_LOOT[i].0);
+    if slot.item == ItemId::SilverCoin {
+        slot.count = (slot.count * coin_mult).min(slot.item.max_stack());
+    }
+    slot
+}
+
 fn roll(rng: &mut Pcg32, entry: &LootRoll) -> InvSlot {
     let item = match entry.alt {
         Some(alt) if rng.chance(0.5) => alt,
@@ -182,5 +211,59 @@ mod tests {
     #[test]
     fn pot_weights_total_100() {
         assert_eq!(POT_LOOT.iter().map(|&(_, w)| w).sum::<u32>(), 100);
+        assert!(POT_LOOT.iter().all(|&(_, w)| w > 0));
+    }
+
+    #[test]
+    fn pot_coin_mult_bands_scale_with_height() {
+        // Full-size world: §1.1 rows directly.
+        assert_eq!(pot_coin_mult(0, 1200), 1);
+        assert_eq!(pot_coin_mult(449, 1200), 1);
+        assert_eq!(pot_coin_mult(450, 1200), 2);
+        assert_eq!(pot_coin_mult(999, 1200), 2);
+        assert_eq!(pot_coin_mult(1000, 1200), 4);
+        assert_eq!(pot_coin_mult(1199, 1200), 4);
+        // Scaled world (300 rows): bands at 112/113 and 250.
+        assert_eq!(pot_coin_mult(112, 300), 1);
+        assert_eq!(pot_coin_mult(113, 300), 2);
+        assert_eq!(pot_coin_mult(250, 300), 4);
+    }
+
+    #[test]
+    fn pot_rolls_stay_within_spec_ranges() {
+        // §2.3: 50% 1–10 SC (×depth), 20% 3–8 torches, 15% 1 lesser healing
+        // potion, 10% 10–20 wooden arrows, 5% 1–4 gel.
+        let mut rng = Pcg32::new(0xbeef);
+        let mut seen = [0u32; 5];
+        for _ in 0..2000 {
+            let s = roll_pot(&mut rng, POT_COIN_MULT_CAVERN);
+            match s.item {
+                ItemId::SilverCoin => {
+                    seen[0] += 1;
+                    assert!((2..=20).contains(&s.count), "coins ×2: {}", s.count);
+                    assert_eq!(s.count % 2, 0, "scaled coin count: {}", s.count);
+                }
+                ItemId::Torch => {
+                    seen[1] += 1;
+                    assert!((3..=8).contains(&s.count));
+                }
+                ItemId::LesserHealingPotion => {
+                    seen[2] += 1;
+                    assert_eq!(s.count, 1);
+                }
+                ItemId::WoodenArrow => {
+                    seen[3] += 1;
+                    assert!((10..=20).contains(&s.count));
+                }
+                ItemId::Gel => {
+                    seen[4] += 1;
+                    assert!((1..=4).contains(&s.count));
+                }
+                other => panic!("{other:?} is not in the pot table"),
+            }
+        }
+        // Rough weight sanity: coins dominate, everything appears.
+        assert!(seen.iter().all(|&n| n > 0), "{seen:?}");
+        assert!(seen[0] > seen[1] && seen[1] > seen[4], "{seen:?}");
     }
 }

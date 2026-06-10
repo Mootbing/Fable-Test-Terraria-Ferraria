@@ -37,6 +37,11 @@ pub const SAPLING_GROW_MIN_SECS: f32 = 300.0;
 pub const SAPLING_GROW_MAX_SECS: f32 = 600.0;
 pub const SAPLING_AIR_NEEDED: u32 = 7;
 
+/// Trees are 7–16 trunk segments tall (§1.2 pass 9; grown saplings match
+/// world-gen trees).
+pub const TREE_HEIGHT_MIN: u32 = 7;
+pub const TREE_HEIGHT_MAX: u32 = 16;
+
 /// Hammering a Ritual Altar deals 50% of the striker's current HP (§2).
 pub const RITUAL_ALTAR_BACKLASH_HP_FRACTION: f32 = 0.5;
 
@@ -390,12 +395,16 @@ impl Liquid {
 ///   sprite variant for plain tiles (grass decoration etc.).
 /// - bits 3–4: multi-tile part y offset ([`part_y`]).
 /// - bit 5: [`DOOR_OPEN`] on doors; [`BOTTLE_ON_TOP`] on tables/workbenches.
-/// - bit 6: reserved.
+/// - bit 6: [`DOOR_OPEN_LEFT`] on open doors (panel side).
 /// - bit 7: [`WALL_PLACED`] — the wall in this cell was player-placed and
 ///   drops its item when hammered (natural walls drop nothing).
 pub mod state {
     /// Door is open (not solid). Doors are 1×3; part offsets still apply.
     pub const DOOR_OPEN: u8 = 1 << 5;
+    /// The open door's panel swings against the left jamb (away from the
+    /// player who toggled it); unset = right. Render-side only — the door
+    /// column itself is the non-solid passage either way.
+    pub const DOOR_OPEN_LEFT: u8 = 1 << 6;
     /// A Bottle sits on this Table/Workbench cell, enabling the
     /// `Station::Bottle` crafting station (§4.4).
     pub const BOTTLE_ON_TOP: u8 = 1 << 5;

@@ -23,6 +23,7 @@ use ferraria_shared::tiles::TileId;
 use ferraria_shared::world::{World, WORLD_HEIGHT, WORLD_WIDTH};
 
 pub use caves::surface_scan;
+pub use flora::plant_tree;
 pub use ores::OreSpec;
 
 /// DESIGN baselines that everything scales from.

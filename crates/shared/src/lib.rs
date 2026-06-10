@@ -35,6 +35,30 @@ pub const DT: f32 = 1.0 / TICK_RATE as f32;
 /// Players can mine/place/interact within this many tiles of their center.
 pub const REACH: f32 = 6.0;
 
+/// Whether the tile cell `(x, y)` is within [`REACH`] of a player whose
+/// center is `center` (§8). Measured center-to-cell-center, Euclidean; the
+/// client uses the same test to color the cursor highlight, so both sides
+/// must agree.
+pub fn tile_in_reach(center: (f32, f32), x: u32, y: u32) -> bool {
+    let dx = center.0 - (x as f32 + 0.5);
+    let dy = center.1 - (y as f32 + 0.5);
+    dx * dx + dy * dy <= REACH * REACH
+}
+
+// ---- Item-drop entities (§2 drops, §11 "dropped items") ---------------------
+// DESIGN fixes the behaviors (world-shared, first pickup wins, destroyed in
+// lava, death piles persist 10 min); the v1 magnitudes are canonized here.
+
+/// A fresh drop can't be picked up for this long (so mining doesn't vacuum
+/// the block straight into the inventory before it's visible).
+pub const ITEM_PICKUP_ARM_SECS: f32 = 0.5;
+/// Players auto-collect armed drops within this distance of their hitbox.
+pub const ITEM_PICKUP_RADIUS: f32 = 1.5;
+/// Same-item drops within this distance merge into one stack.
+pub const ITEM_MERGE_RADIUS: f32 = 1.0;
+/// Drops despawn after 10 minutes (matches the §8 death-pile persistence).
+pub const ITEM_DESPAWN_SECS: f32 = 600.0;
+
 // ---- Netcode (ARCHITECTURE.md "Wire protocol" / "Authority model") ---------
 
 /// Hard cap on concurrently connected players; the server rejects further
@@ -150,5 +174,15 @@ mod tests {
     #[test]
     fn tick_constants_agree() {
         assert_eq!((1.0 / DT).round() as u32, TICK_RATE);
+    }
+
+    #[test]
+    fn reach_is_six_tiles_from_center() {
+        let center = (10.5, 10.5); // center of tile (10, 10)
+        assert!(tile_in_reach(center, 10, 10));
+        assert!(tile_in_reach(center, 16, 10)); // exactly 6 tiles away
+        assert!(!tile_in_reach(center, 17, 10)); // 7 tiles away
+        assert!(!tile_in_reach(center, 15, 15)); // ~7.07 diagonal
+        assert!(tile_in_reach(center, 14, 14)); // ~5.66 diagonal
     }
 }

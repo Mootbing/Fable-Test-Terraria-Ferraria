@@ -420,6 +420,24 @@ pub enum ServerMessage {
         slot: u8,
         item: Option<ItemId>,
     },
+    /// Mining progress on a cell (tile or wall layer — clients draw one
+    /// crack overlay per cell either way). `damage_frac` is the accumulated
+    /// damage as a fraction of the §2 break points, scaled 0–255. Cracks
+    /// expire client-side after `tiles::TILE_DAMAGE_RESET_SECS` without a
+    /// new frame, mirroring the server's decay, and clear on any
+    /// `TileChanged` for the cell.
+    BlockCrack {
+        x: u32,
+        y: u32,
+        damage_frac: u8,
+    },
+    /// Batched cell deltas for world systems that change many cells per tick
+    /// (fluid flow, falling sand, grass spread, tree growth). Semantically a
+    /// list of [`ServerMessage::TileChanged`]; player-driven single-cell
+    /// changes still use the immediate form.
+    TilesChanged {
+        changes: Vec<(u32, u32, Tile)>,
+    },
 }
 
 /// Encodes a message into a postcard frame. Infallible for these types
@@ -608,6 +626,26 @@ mod tests {
             id: 1,
             slot: 4,
             item: None,
+        });
+        roundtrip_server(ServerMessage::BlockCrack {
+            x: 4199,
+            y: 1199,
+            damage_frac: 255,
+        });
+        roundtrip_server(ServerMessage::TilesChanged {
+            changes: vec![
+                (10, 20, Tile::of(TileId::Sand)),
+                (
+                    10,
+                    21,
+                    Tile {
+                        id: TileId::Air,
+                        wall: WallId::Stone,
+                        liquid: Liquid::new(LiquidKind::Water, 1),
+                        state: 0,
+                    },
+                ),
+            ],
         });
     }
 

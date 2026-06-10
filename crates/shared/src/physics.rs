@@ -47,6 +47,17 @@ pub const COBWEB_MAX_SPEED: f32 = 1.5;
 pub const SAFE_FALL_TILES: f32 = 25.0;
 pub const FALL_DAMAGE_PER_TILE: f32 = 10.0;
 
+// ---- Item-drop entity tuning -------------------------------------------------
+// Gravity/terminal velocity are the global §0 caps above; DESIGN doesn't pin
+// the rest, so it's canonized here (like the enemy hitboxes below).
+
+/// Ground friction deceleration for resting item drops, tiles/s².
+pub const ITEM_FRICTION: f32 = 30.0;
+/// Fresh drops pop out with vx in ±this, tiles/s...
+pub const ITEM_SPAWN_SPEED_X: f32 = 3.0;
+/// ...and vy upward between these two magnitudes, tiles/s.
+pub const ITEM_SPAWN_SPEED_Y: (f32, f32) = (2.0, 6.0);
+
 /// How long platforms stay intangible after a Down+Jump drop.
 pub const DROP_THROUGH_SECS: f32 = 0.25;
 
@@ -475,6 +486,52 @@ pub fn step_player(
     out
 }
 
+/// Advances one item-drop entity by `dt` seconds: gravity capped at terminal
+/// velocity (×§3 multipliers while submerged), axis-separated AABB collision
+/// against solids (landing also on platform tops), and ground friction.
+/// Returns whether the drop ended the step on the ground. Runs server-side
+/// only, but lives here with the rest of the deterministic stepping.
+pub fn step_item_drop(world: &World, pos: &mut (f32, f32), vel: &mut (f32, f32), dt: f32) -> bool {
+    let size = hitbox::ITEM_DROP;
+    let submerged = liquid_at_center(world, *pos, size).is_some();
+    let (g_mult, t_mult) = if submerged {
+        (LIQUID_GRAVITY_MULT, LIQUID_TERMINAL_MULT)
+    } else {
+        (1.0, 1.0)
+    };
+    vel.1 += GRAVITY * g_mult * dt;
+    let terminal = TERMINAL_VELOCITY * t_mult;
+    if vel.1 > terminal {
+        vel.1 = terminal;
+    }
+
+    let dx = vel.0 * dt;
+    if dx != 0.0 {
+        let (nx, blocked) = sweep_x(world, *pos, size, dx);
+        pos.0 = nx;
+        if blocked {
+            vel.0 = 0.0;
+        }
+    }
+
+    let dy = vel.1 * dt;
+    let (ny, hit_floor, hit_ceiling) = sweep_y(world, *pos, size, dy, false);
+    pos.1 = ny;
+    if hit_ceiling {
+        vel.1 = 0.0;
+    }
+    if hit_floor {
+        vel.1 = 0.0;
+        let f = ITEM_FRICTION * dt;
+        if vel.0.abs() <= f {
+            vel.0 = 0.0;
+        } else {
+            vel.0 -= f * vel.0.signum();
+        }
+    }
+    hit_floor
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -815,6 +872,67 @@ mod tests {
         assert_eq!(fall_damage(25.0), 0);
         assert_eq!(fall_damage(26.0), 10);
         assert_eq!(fall_damage(30.0), 50);
+    }
+
+    #[test]
+    fn item_drops_fall_land_and_stop() {
+        let world = flat_world(); // floor top at y = 10
+        let mut pos = (5.0, 2.0);
+        let mut vel = (3.0, -2.0); // a spawn impulse
+        let mut grounded = false;
+        for _ in 0..240 {
+            grounded = step_item_drop(&world, &mut pos, &mut vel, DT);
+        }
+        assert!(grounded, "came to rest on the floor");
+        let (_, h) = hitbox::ITEM_DROP;
+        assert!(
+            (pos.1 + h - 10.0).abs() < 0.01,
+            "rests on the floor top, bottom at {}",
+            pos.1 + h
+        );
+        assert_eq!(vel, (0.0, 0.0), "friction stopped the slide");
+        assert!(pos.0 > 5.0, "slid in the impulse direction first");
+    }
+
+    #[test]
+    fn item_drops_respect_walls_and_terminal_velocity() {
+        // Wall at column 12 (same map as the player wall test).
+        let mut rows = vec!["............#.".to_string(); 30];
+        rows.push("##############".to_string());
+        let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let world = world_from_ascii(&refs);
+        let mut pos = (5.0, 0.0);
+        let mut vel = (50.0, 0.0);
+        let mut max_vy: f32 = 0.0;
+        for _ in 0..240 {
+            step_item_drop(&world, &mut pos, &mut vel, DT);
+            max_vy = max_vy.max(vel.1);
+        }
+        assert!(max_vy <= TERMINAL_VELOCITY);
+        let (w, _) = hitbox::ITEM_DROP;
+        assert!(pos.0 + w <= 12.0, "stopped at the wall ({})", pos.0 + w);
+    }
+
+    #[test]
+    fn item_drops_rest_on_platforms() {
+        let world = world_from_ascii(&[
+            "..........",
+            "..........",
+            "----------",
+            "..........",
+            "##########",
+        ]);
+        let mut pos = (4.0, 0.0);
+        let mut vel = (0.0, 0.0);
+        for _ in 0..120 {
+            step_item_drop(&world, &mut pos, &mut vel, DT);
+        }
+        let (_, h) = hitbox::ITEM_DROP;
+        assert!(
+            (pos.1 + h - 2.0).abs() < 0.01,
+            "landed on the platform, bottom at {}",
+            pos.1 + h
+        );
     }
 
     #[test]
