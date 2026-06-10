@@ -41,6 +41,10 @@ pub const FLAMING_ARROW_BURN_SECS: f32 = 3.0;
 /// Healing potions inflict Potion Sickness for 60 s (§4.4).
 pub const POTION_SICKNESS_SECS: f32 = 60.0;
 
+/// Swing interval with no tool/weapon in hand (smashing pots bare-handed).
+/// DESIGN gives no bare-hand row; canonized to the wood-tier use time.
+pub const BARE_HAND_USE_SECS: f32 = 0.30;
+
 /// Warp Mirror channels for 1 s before teleporting (§4.3).
 pub const WARP_MIRROR_CHANNEL_SECS: f32 = 1.0;
 
@@ -492,6 +496,27 @@ impl ItemId {
     pub fn max_stack(self) -> u16 {
         self.data().max_stack
     }
+
+    /// Item drops that touch lava are destroyed *except* Obsidian, Hellstone,
+    /// and Ember-tier items (§3) — everything forged from/for the underworld.
+    pub fn lava_immune(self) -> bool {
+        matches!(
+            self,
+            ItemId::Obsidian
+                | ItemId::ObsidianCharm
+                | ItemId::Hellstone
+                | ItemId::InfernalForge
+                | ItemId::EmberBar
+                | ItemId::EmberBrick
+                | ItemId::EmberPickaxe
+                | ItemId::EmberAxe
+                | ItemId::EmberBlade
+                | ItemId::Cinderbow
+                | ItemId::EmberHelmet
+                | ItemId::EmberChestplate
+                | ItemId::EmberGreaves
+        )
+    }
 }
 
 /// One occupied inventory/chest slot. Empty slots are `Option::None`.
@@ -529,6 +554,46 @@ pub mod inventory {
     pub const ACCESSORY_START: usize = ARMOR_START + ARMOR;
     pub const TRASH: usize = ACCESSORY_START + ACCESSORY;
     pub const TOTAL: usize = TRASH + 1;
+}
+
+/// Adds `count` of `item` into the carry slots (hotbar then backpack; never
+/// armor/accessory/trash): merges into existing stacks first, then fills
+/// empty slots. Returns how many were actually added (0 = no room) and the
+/// indices of every slot modified, for `SlotChanged` deltas.
+pub fn add_to_inventory(
+    slots: &mut [Option<InvSlot>],
+    item: ItemId,
+    count: u16,
+) -> (u16, Vec<usize>) {
+    let max = item.max_stack();
+    let carry = inventory::ARMOR_START.min(slots.len());
+    let mut left = count;
+    let mut changed = Vec::new();
+    for (i, slot) in slots.iter_mut().enumerate().take(carry) {
+        if left == 0 {
+            break;
+        }
+        if let Some(s) = slot {
+            if s.item == item && s.count < max {
+                let add = (max - s.count).min(left);
+                s.count += add;
+                left -= add;
+                changed.push(i);
+            }
+        }
+    }
+    for (i, slot) in slots.iter_mut().enumerate().take(carry) {
+        if left == 0 {
+            break;
+        }
+        if slot.is_none() {
+            let add = max.min(left);
+            *slot = Some(InvSlot::new(item, add));
+            left -= add;
+            changed.push(i);
+        }
+    }
+    (count - left, changed)
 }
 
 #[cfg(test)]
@@ -631,6 +696,50 @@ mod tests {
         let bow = ItemId::Cinderbow.data().weapon.expect("weapon");
         assert_eq!((bow.damage, bow.kind), (29, WeaponKind::Bow));
         assert_eq!(ItemId::WoodenArrow.data().weapon.expect("weapon").damage, 5);
+    }
+
+    #[test]
+    fn add_to_inventory_merges_then_fills() {
+        let mut slots: Vec<Option<InvSlot>> = vec![None; inventory::TOTAL];
+        slots[0] = Some(InvSlot::new(ItemId::Dirt, 990));
+        slots[2] = Some(InvSlot::new(ItemId::Stone, 5));
+
+        // Merges into the existing dirt stack, overflow goes to slot 1.
+        let (added, changed) = add_to_inventory(&mut slots, ItemId::Dirt, 20);
+        assert_eq!(added, 20);
+        assert_eq!(changed, vec![0, 1]);
+        assert_eq!(slots[0], Some(InvSlot::new(ItemId::Dirt, 999)));
+        assert_eq!(slots[1], Some(InvSlot::new(ItemId::Dirt, 11)));
+
+        // Non-stackables take one empty slot each.
+        let (added, changed) = add_to_inventory(&mut slots, ItemId::GoldSword, 1);
+        assert_eq!((added, changed), (1, vec![3]));
+
+        // A full carry section refuses (armor/trash slots never used).
+        for s in slots.iter_mut().take(inventory::ARMOR_START) {
+            *s = Some(InvSlot::new(ItemId::Stone, 999));
+        }
+        let (added, changed) = add_to_inventory(&mut slots, ItemId::Stone, 7);
+        assert_eq!((added, changed), (0, vec![]));
+        assert!(slots[inventory::ARMOR_START..].iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn add_to_inventory_partial_fit() {
+        let mut slots: Vec<Option<InvSlot>> = vec![Some(InvSlot::new(ItemId::Gel, 990)); 1];
+        let (added, changed) = add_to_inventory(&mut slots, ItemId::Gel, 100);
+        assert_eq!((added, changed), (9, vec![0]));
+        assert_eq!(slots[0], Some(InvSlot::new(ItemId::Gel, 999)));
+    }
+
+    #[test]
+    fn lava_immunity_covers_the_underworld_tier() {
+        assert!(ItemId::Obsidian.lava_immune());
+        assert!(ItemId::Hellstone.lava_immune());
+        assert!(ItemId::EmberBar.lava_immune());
+        assert!(ItemId::EmberBlade.lava_immune());
+        assert!(!ItemId::Wood.lava_immune());
+        assert!(!ItemId::GoldPickaxe.lava_immune());
     }
 
     #[test]

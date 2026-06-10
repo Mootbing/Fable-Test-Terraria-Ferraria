@@ -31,9 +31,14 @@ use ferraria_shared::world::{
     World, CHUNK_SIZE, CHUNK_SUB_HYSTERESIS, CHUNK_SUB_RADIUS_X, CHUNK_SUB_RADIUS_Y, DAY_TICKS,
 };
 use ferraria_shared::{
-    CHAT_MAX_CHARS, MAX_NAME_CHARS, MAX_PLAYERS, MAX_PLAYER_SPEED, MAX_TELEPORT_BUDGET_TILES,
-    MAX_TELEPORT_PER_TICK, SNAPSHOT_INTERVAL_TICKS, TICK_RATE, TIME_SYNC_INTERVAL_TICKS,
+    CHAT_MAX_CHARS, HELD_ITEM_BROADCAST_MIN_TICKS, MAX_NAME_CHARS, MAX_PLAYERS, MAX_PLAYER_SPEED,
+    MAX_TELEPORT_BUDGET_TILES, MAX_TELEPORT_PER_TICK, SNAPSHOT_INTERVAL_TICKS, TICK_RATE,
+    TIME_SYNC_INTERVAL_TICKS,
 };
+
+use super::entities::EntityStore;
+use super::fluids::FluidSim;
+use super::interact::TileDamage;
 
 /// One encoded `ServerMessage`, shared between sessions without re-encoding.
 pub type Frame = Arc<[u8]>;
@@ -79,26 +84,28 @@ pub enum SimCommand {
     Disconnect { player_id: u32, epoch: u64 },
 }
 
-/// A connected player.
-struct Player {
-    name: String,
+/// A connected player. `pub(crate)` so the sibling sim modules
+/// (`interact`, `entities`, `world_tick`) can implement their systems as
+/// further `impl Sim` blocks.
+pub(crate) struct Player {
+    pub(crate) name: String,
     token: AuthToken,
     /// Session generation; commands carrying a different epoch are stale
     /// (see [`SimCommand`]).
     epoch: u64,
     /// Top-left of the AABB, tile units (the `PlayerState` convention).
-    pos: (f32, f32),
-    vel: (f32, f32),
+    pub(crate) pos: (f32, f32),
+    pub(crate) vel: (f32, f32),
     facing: i8,
     anim: u8,
     /// Movement changed since the last snapshot broadcast.
     moved: bool,
-    held_slot: u8,
+    pub(crate) held_slot: u8,
     /// Flat §8 layout (`items::inventory`), server-authoritative.
-    inventory: Vec<Option<InvSlot>>,
+    pub(crate) inventory: Vec<Option<InvSlot>>,
     /// Chunks this session currently receives ([`ServerMessage::ChunkData`]
     /// sent on subscribe; tile deltas while subscribed).
-    chunks: HashSet<(u32, u32)>,
+    pub(crate) chunks: HashSet<(u32, u32)>,
     /// Sim tick when the last `PlayerState` was processed (replenishes
     /// `move_budget`).
     last_state_tick: u64,
@@ -108,18 +115,31 @@ struct Player {
     /// its actual distance, so stacking messages within one tick cannot
     /// stack fresh clamp budgets.
     move_budget: f32,
+    /// Tick of the last accepted tool swing (`HitTile`/`HitWall` rate
+    /// limiting, §2/§4.1); `None` until the first swing of the session.
+    pub(crate) last_swing_tick: Option<u64>,
+    /// Tick of the last accepted `ToggleDoor`
+    /// ([`crate::sim::interact`]-enforced anti-amplification cooldown,
+    /// [`ferraria_shared::DOOR_TOGGLE_COOLDOWN_TICKS`]).
+    pub(crate) last_door_toggle_tick: Option<u64>,
+    /// Tick of the last selection-driven `PlayerHeldItem` broadcast;
+    /// `SelectSlot` floods coalesce against it
+    /// ([`ferraria_shared::HELD_ITEM_BROADCAST_MIN_TICKS`]).
+    last_held_broadcast_tick: Option<u64>,
+    /// A coalesced selection broadcast is pending for this player.
+    held_broadcast_dirty: bool,
     tx: mpsc::Sender<Frame>,
 }
 
 impl Player {
-    fn center(&self) -> (f32, f32) {
+    pub(crate) fn center(&self) -> (f32, f32) {
         (
             self.pos.0 + PLAYER_WIDTH / 2.0,
             self.pos.1 + PLAYER_HEIGHT / 2.0,
         )
     }
 
-    fn held_item(&self) -> Option<ItemId> {
+    pub(crate) fn held_item(&self) -> Option<ItemId> {
         self.inventory
             .get(self.held_slot as usize)
             .copied()
@@ -139,11 +159,13 @@ struct OfflinePlayer {
     inventory: Vec<Option<InvSlot>>,
 }
 
-/// The authoritative game state, owned by [`run`]'s task.
+/// The authoritative game state, owned by [`run`]'s task. Fields are
+/// `pub(crate)` for the sibling sim modules (`interact`, `entities`,
+/// `world_tick`), which extend `Sim` with further `impl` blocks.
 pub struct Sim {
-    world: World,
-    tick: u64,
-    players: HashMap<u32, Player>,
+    pub(crate) world: World,
+    pub(crate) tick: u64,
+    pub(crate) players: HashMap<u32, Player>,
     offline: HashMap<String, OfflinePlayer>,
     next_player_id: u32,
     /// Monotonic session-generation counter (player ids are reused across
@@ -158,11 +180,34 @@ pub struct Sim {
     pending_kicks: Vec<u32>,
     /// Mirror of `players.len()` for the /api/status handler.
     player_count: Arc<AtomicUsize>,
+    /// Live fluid automaton over `world` (§3 cadence in `world_tick`).
+    pub(crate) fluids: FluidSim,
+    /// Server-simulated entities (item drops now; enemies/projectiles later).
+    pub(crate) entities: EntityStore,
+    /// Accumulated §2 mining damage per cell. Key: `(x, y, wall_layer)`.
+    pub(crate) tile_damage: HashMap<(u32, u32, bool), TileDamage>,
+    /// Sand cells queued for the §2 falling check next tick.
+    pub(crate) sand_active: HashSet<(u32, u32)>,
+    /// Player-planted saplings → tick they may grow into a tree (§2 tile 31).
+    pub(crate) saplings: HashMap<(u32, u32), u64>,
+    /// Level-1 puddle cells → first-seen tick (§3 evaporation).
+    pub(crate) puddles: HashMap<(u32, u32), u64>,
+    /// Loot/world-event randomness (pot rolls, acorn drops, spawn impulses).
+    pub(crate) loot_rng: Pcg32,
+    /// Cells changed by batched systems this tick, flushed as one
+    /// [`ServerMessage::TilesChanged`] per subscribed player.
+    tile_batch: Vec<(u32, u32)>,
+    /// Cells whose fixtures must re-validate their §2 support rules after a
+    /// nearby change (torch attachment, furniture floors, door frames).
+    /// Queued by [`Sim::queue_support_checks`], drained by
+    /// `Sim::revalidate_supports` after every command and every tick.
+    pub(crate) support_checks: Vec<(u32, u32)>,
 }
 
 impl Sim {
     pub fn new(world: World, player_count: Arc<AtomicUsize>) -> Sim {
-        Sim {
+        let fluids = FluidSim::new(&world);
+        let mut sim = Sim {
             world,
             tick: 0,
             players: HashMap::new(),
@@ -173,7 +218,18 @@ impl Sim {
             token_rng: Pcg32::new(entropy_seed()),
             pending_kicks: Vec::new(),
             player_count,
-        }
+            fluids,
+            entities: EntityStore::new(),
+            tile_damage: HashMap::new(),
+            sand_active: HashSet::new(),
+            saplings: HashMap::new(),
+            puddles: HashMap::new(),
+            loot_rng: Pcg32::new(entropy_seed() ^ 0x1007_caf3),
+            tile_batch: Vec::new(),
+            support_checks: Vec::new(),
+        };
+        sim.scan_initial_puddles();
+        sim
     }
 
     /// Applies one session command. Public so tests can drive the sim
@@ -193,6 +249,9 @@ impl Sim {
             } => self.handle_message(player_id, epoch, msg),
             SimCommand::Disconnect { player_id, epoch } => self.disconnect(player_id, epoch),
         }
+        // Fixtures whose support the command removed pop before anything
+        // else observes the world.
+        self.revalidate_supports();
         self.flush_kicks();
     }
 
@@ -239,7 +298,19 @@ impl Sim {
             }
         }
 
-        // (Later PRs: enemies, fluids, item drops, NPCs tick here.)
+        // Live world systems (fluids §3, sand/grass/saplings §2) and
+        // entities. Their batched cell changes flush as one `TilesChanged`
+        // per player at the end of the tick.
+        self.world_tick();
+        self.tick_entities();
+        self.revalidate_supports();
+        self.flush_held_item_broadcasts();
+        self.flush_tile_batch();
+        if self.tick.is_multiple_of(SNAPSHOT_INTERVAL_TICKS as u64) {
+            self.broadcast_entity_updates();
+        }
+
+        // (Later PRs: enemies, NPCs tick here.)
 
         self.flush_kicks();
     }
@@ -305,6 +376,10 @@ impl Sim {
             last_state_tick: self.tick,
             // One tick of allowance until the first state replenishes it.
             move_budget: MAX_TELEPORT_PER_TICK,
+            last_swing_tick: None,
+            last_door_toggle_tick: None,
+            last_held_broadcast_tick: None,
+            held_broadcast_dirty: false,
             tx,
         };
 
@@ -459,6 +534,15 @@ impl Sim {
             } => self.player_state(id, pos, vel, facing, anim),
             ClientMessage::SelectSlot { slot } => self.select_slot(id, slot),
             ClientMessage::Chat { text } => self.chat(id, text),
+            ClientMessage::HitTile { x, y } => self.hit_tile(id, x, y),
+            ClientMessage::HitWall { x, y } => self.hit_wall(id, x, y),
+            ClientMessage::PlaceTile { x, y, hotbar_slot } => {
+                self.place_tile(id, x, y, hotbar_slot)
+            }
+            ClientMessage::PlaceWall { x, y, hotbar_slot } => {
+                self.place_wall(id, x, y, hotbar_slot)
+            }
+            ClientMessage::ToggleDoor { x, y } => self.toggle_door(id, x, y),
             other => {
                 tracing::debug!(player = id, msg = ?other, "intent not implemented yet");
             }
@@ -515,17 +599,62 @@ impl Sim {
         if slot as usize >= inventory::HOTBAR {
             return;
         }
+        let tick = self.tick;
         let Some(p) = self.players.get_mut(&id) else {
             return;
         };
         p.held_slot = slot;
+        // Anti-amplification: a SelectSlot flood coalesces to one broadcast
+        // per HELD_ITEM_BROADCAST_MIN_TICKS; the trailing selection is
+        // flushed by `flush_held_item_broadcasts` when the window elapses.
+        if p.last_held_broadcast_tick
+            .is_none_or(|t| tick.saturating_sub(t) >= HELD_ITEM_BROADCAST_MIN_TICKS)
+        {
+            p.last_held_broadcast_tick = Some(tick);
+            p.held_broadcast_dirty = false;
+            self.broadcast_held_item(id);
+        } else {
+            p.held_broadcast_dirty = true;
+        }
+    }
+
+    /// Sends the deferred (coalesced) selection broadcasts whose window
+    /// elapsed this tick — so a slot-spamming client ends up announcing its
+    /// final selection, just rate-capped.
+    fn flush_held_item_broadcasts(&mut self) {
+        let tick = self.tick;
+        let due: Vec<u32> = self
+            .players
+            .iter()
+            .filter(|(_, p)| {
+                p.held_broadcast_dirty
+                    && p.last_held_broadcast_tick
+                        .is_none_or(|t| tick.saturating_sub(t) >= HELD_ITEM_BROADCAST_MIN_TICKS)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in due {
+            if let Some(p) = self.players.get_mut(&id) {
+                p.held_broadcast_dirty = false;
+                p.last_held_broadcast_tick = Some(tick);
+            }
+            self.broadcast_held_item(id);
+        }
+    }
+
+    /// Re-announces what `id` is holding (slot selection, or the held stack
+    /// changed/emptied through placement or pickup). Remote clients render
+    /// it; the owner already knows their own inventory.
+    pub(crate) fn broadcast_held_item(&mut self, id: u32) {
+        let Some(p) = self.players.get(&id) else {
+            return;
+        };
         let frame: Frame = encode(&ServerMessage::PlayerHeldItem {
             id,
-            slot,
+            slot: p.held_slot,
             item: p.held_item(),
         })
         .into();
-        // Remote clients render the held item; the owner already knows.
         self.broadcast_frame(&frame, Some(id));
     }
 
@@ -543,18 +672,109 @@ impl Sim {
 
     // ---- World mutation -------------------------------------------------------
 
-    /// The single tile-mutation point: writes the tile, invalidates the
-    /// chunk cache, and pushes the delta to every subscribed player. All
-    /// future mining/placing/door/growth code must change tiles through
-    /// here so caches and clients can never go stale.
+    /// The single *immediate* tile-mutation point: writes the tile,
+    /// invalidates the chunk cache, pushes the delta to every subscribed
+    /// player, and wakes the world systems (fluids, sand, puddles, mining
+    /// damage) around the cell. Player-driven changes (mining, placing,
+    /// doors) go through here; high-volume systems use [`Sim::stage_tile`] +
+    /// the per-tick `TilesChanged` flush instead.
     pub fn change_tile(&mut self, x: u32, y: u32, tile: Tile) {
         if !self.world.in_bounds(x, y) {
             return;
         }
         self.world.set_tile(x, y, tile);
+        self.chunk_cache
+            .remove(&((x / CHUNK_SIZE), (y / CHUNK_SIZE)));
+        self.broadcast_at(x, y, &ServerMessage::TileChanged { x, y, tile });
+        self.wake_cell(x, y);
+    }
+
+    /// Batched counterpart of [`Sim::change_tile`]: the world cell must
+    /// already be written; this invalidates the chunk cache and queues the
+    /// cell for the end-of-tick [`ServerMessage::TilesChanged`] flush.
+    pub(crate) fn stage_tile(&mut self, x: u32, y: u32) {
+        self.chunk_cache
+            .remove(&((x / CHUNK_SIZE), (y / CHUNK_SIZE)));
+        self.tile_batch.push((x, y));
+    }
+
+    /// Wakes the systems watching a changed cell: re-marks the fluid
+    /// neighborhood, queues sand-fall checks (this cell and the one above),
+    /// queues §2 support re-validation for the neighborhood's fixtures,
+    /// refreshes puddle tracking, and clears stale mining damage.
+    pub(crate) fn wake_cell(&mut self, x: u32, y: u32) {
+        self.tile_damage.remove(&(x, y, false));
+        self.tile_damage.remove(&(x, y, true));
+        self.fluids.mark(x, y);
+        self.fluids.mark(x.wrapping_sub(1), y);
+        self.fluids.mark(x + 1, y);
+        self.fluids.mark(x, y.wrapping_sub(1));
+        self.fluids.mark(x, y + 1);
+        for (sx, sy) in [(x, y), (x, y.wrapping_sub(1))] {
+            if self.world.in_bounds(sx, sy)
+                && self.world.tile(sx, sy).id == ferraria_shared::tiles::TileId::Sand
+            {
+                self.sand_active.insert((sx, sy));
+            }
+        }
+        self.queue_support_checks(x, y);
+        self.track_puddle(x, y);
+        self.track_puddle(x, y.wrapping_sub(1));
+        self.track_puddle(x, y + 1);
+    }
+
+    /// Queues the changed cell and its cardinal neighbors for §2 fixture
+    /// support re-validation (torch attachment, furniture floors, door
+    /// frames — see `Sim::revalidate_supports`).
+    pub(crate) fn queue_support_checks(&mut self, x: u32, y: u32) {
+        for (cx, cy) in [
+            (x, y),
+            (x.wrapping_sub(1), y),
+            (x + 1, y),
+            (x, y.wrapping_sub(1)),
+            (x, y + 1),
+        ] {
+            if self.world.in_bounds(cx, cy) {
+                self.support_checks.push((cx, cy));
+            }
+        }
+    }
+
+    /// Sends the accumulated batched cell changes as one `TilesChanged` per
+    /// player, filtered to each player's subscribed chunks.
+    fn flush_tile_batch(&mut self) {
+        if self.tile_batch.is_empty() {
+            return;
+        }
+        let mut cells = std::mem::take(&mut self.tile_batch);
+        cells.sort_unstable();
+        cells.dedup();
+        let changes: Vec<(u32, u32, Tile)> = cells
+            .into_iter()
+            .filter(|&(x, y)| self.world.in_bounds(x, y))
+            .map(|(x, y)| (x, y, self.world.tile(x, y)))
+            .collect();
+        let ids: Vec<u32> = self.players.keys().copied().collect();
+        for id in ids {
+            let Some(p) = self.players.get(&id) else {
+                continue;
+            };
+            let mine: Vec<(u32, u32, Tile)> = changes
+                .iter()
+                .filter(|&&(x, y, _)| p.chunks.contains(&(x / CHUNK_SIZE, y / CHUNK_SIZE)))
+                .copied()
+                .collect();
+            if !mine.is_empty() {
+                self.send_to(id, &ServerMessage::TilesChanged { changes: mine });
+            }
+        }
+    }
+
+    /// Broadcasts a message to every player subscribed to the chunk
+    /// containing cell `(x, y)`.
+    pub(crate) fn broadcast_at(&mut self, x: u32, y: u32, msg: &ServerMessage) {
         let chunk = (x / CHUNK_SIZE, y / CHUNK_SIZE);
-        self.chunk_cache.remove(&chunk);
-        let frame: Frame = encode(&ServerMessage::TileChanged { x, y, tile }).into();
+        let frame: Frame = encode(msg).into();
         let subscribed: Vec<u32> = self
             .players
             .iter()
@@ -604,12 +824,26 @@ impl Sim {
             .into_iter()
             .map(|c| (c, self.chunk_frame(c.0, c.1)))
             .collect();
+        // Entities already living in newly entered chunks stream alongside
+        // the terrain (their spawn broadcasts only reached players whose
+        // window contained them at the time).
+        let entity_frames: Vec<Frame> = frames
+            .iter()
+            .flat_map(|&(c, _)| self.entities.spawn_messages_in_chunk(c))
+            .map(|msg| -> Frame { encode(&msg).into() })
+            .collect();
         let mut dead = false;
         if let Some(p) = self.players.get_mut(&id) {
             for (c, frame) in frames {
                 if p.tx.try_send(frame).is_ok() {
                     p.chunks.insert(c);
                 } else {
+                    dead = true;
+                    break;
+                }
+            }
+            for frame in entity_frames {
+                if p.tx.try_send(frame).is_err() {
                     dead = true;
                     break;
                 }
@@ -640,7 +874,7 @@ impl Sim {
 
     // ---- Outbound helpers -------------------------------------------------------
 
-    fn send_to(&mut self, id: u32, msg: &ServerMessage) {
+    pub(crate) fn send_to(&mut self, id: u32, msg: &ServerMessage) {
         self.send_frame_to(id, encode(msg).into());
     }
 
@@ -652,7 +886,7 @@ impl Sim {
         }
     }
 
-    fn broadcast(&mut self, msg: &ServerMessage) {
+    pub(crate) fn broadcast(&mut self, msg: &ServerMessage) {
         let frame: Frame = encode(msg).into();
         self.broadcast_frame(&frame, None);
     }
@@ -1194,6 +1428,44 @@ mod tests {
         msg(&mut sim, b, b_epoch, ClientMessage::SelectSlot { slot: 10 });
         assert_eq!(sim.players[&b].held_slot, 1);
         drain(&mut rx_b);
+    }
+
+    #[test]
+    fn select_slot_floods_coalesce_to_rate_capped_broadcasts() {
+        let mut sim = test_sim();
+        let (b, b_epoch, _rx_b) = join(&mut sim, "bob", None);
+        let (_a, _, mut rx_a) = join(&mut sim, "alice", None);
+        drain(&mut rx_a);
+        // 8 selections within one tick: a hostile client could otherwise
+        // amplify each into a PlayerHeldItem broadcast at socket speed.
+        for slot in [1u8, 2, 3, 4, 5, 4, 3, 2] {
+            msg(&mut sim, b, b_epoch, ClientMessage::SelectSlot { slot });
+        }
+        let held: Vec<u8> = drain(&mut rx_a)
+            .into_iter()
+            .filter_map(|m| match m {
+                ServerMessage::PlayerHeldItem { id, slot, .. } if id == b => Some(slot),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(held, vec![1], "only the first broadcast immediately");
+        assert_eq!(
+            sim.players[&b].held_slot, 2,
+            "server state still tracks the final selection"
+        );
+        // The trailing selection flushes once the window elapses — remote
+        // clients converge on what the spammer ends up holding.
+        for _ in 0..HELD_ITEM_BROADCAST_MIN_TICKS {
+            sim.tick();
+        }
+        let held: Vec<u8> = drain(&mut rx_a)
+            .into_iter()
+            .filter_map(|m| match m {
+                ServerMessage::PlayerHeldItem { id, slot, .. } if id == b => Some(slot),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(held, vec![2], "trailing selection flushed exactly once");
     }
 
     #[test]

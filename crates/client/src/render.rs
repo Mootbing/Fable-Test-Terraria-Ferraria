@@ -223,6 +223,23 @@ fn draw_cell(world: &World, x: u32, y: u32, t: Tile, px: f32, py: f32) {
             // Dirt body with a grass cap.
             draw_rectangle(px, py, s, s, tint(TILE_COLORS[TileId::Dirt as usize], b));
             draw_rectangle(px, py, s, s * 0.3, base);
+            // Mushroom forage plant (state::GRASS_MUSHROOM): stem + cap
+            // spilling above the cell, like tree canopies do.
+            if state::variant(t.state) == state::GRASS_MUSHROOM {
+                draw_rectangle(
+                    px + s * 0.44,
+                    py - s * 0.30,
+                    s * 0.12,
+                    s * 0.32,
+                    tint((226, 220, 200), b),
+                );
+                draw_circle(
+                    px + s * 0.5,
+                    py - s * 0.34,
+                    s * 0.24,
+                    tint((196, 62, 58), b),
+                );
+            }
         }
         TileId::Torch => {
             draw_rectangle(
@@ -245,7 +262,14 @@ fn draw_cell(world: &World, x: u32, y: u32, t: Tile, px: f32, py: f32) {
         }
         TileId::Door => {
             if t.state & state::DOOR_OPEN != 0 {
-                draw_rectangle(px, py, s * 0.2, s, base); // swung against the jamb
+                // Swung against the jamb on the side away from whoever
+                // opened it (state::DOOR_OPEN_LEFT).
+                let jamb_x = if t.state & state::DOOR_OPEN_LEFT != 0 {
+                    px
+                } else {
+                    px + s * 0.8
+                };
+                draw_rectangle(jamb_x, py, s * 0.2, s, base);
             } else {
                 draw_rectangle(px + s * 0.15, py, s * 0.7, s, base);
             }
@@ -411,8 +435,15 @@ pub fn draw_player(p: &PlayerDraw) {
     draw_text(p.name, nx, ny, NAME_SIZE, WHITE);
 }
 
-/// Stable distinctive color for a held item swatch (a real sprite later).
-fn item_color(item: ItemId) -> Color {
+/// Base color of a tile at full brightness — for entities that mirror tiles
+/// (falling sand).
+pub fn tile_color(id: TileId) -> Color {
+    tint(TILE_COLORS[id as usize], 1.0)
+}
+
+/// Stable distinctive color for an item swatch — held items, hotbar slots,
+/// and dropped-item entities all share it (a real sprite atlas later).
+pub fn item_color(item: ItemId) -> Color {
     let n = item as u32;
     let mut h = n.wrapping_mul(0x9E37_79B9);
     h ^= h >> 15;

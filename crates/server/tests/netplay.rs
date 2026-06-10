@@ -295,6 +295,90 @@ async fn token_reclaim_restores_position_after_reconnect() {
     assert_eq!(restored, dest, "reclaimed position pushed to the client");
 }
 
+/// The full mine → drop → pickup loop over a real WebSocket: select the
+/// pickaxe, swing at the grass platform under the spawn at the §4.1 swing
+/// cadence (watching `BlockCrack` progress), see the broken tile and the
+/// `ItemDropSpawn`, then collect it (`ItemPickedUp` + `SlotChanged`).
+#[tokio::test]
+async fn mine_drop_and_pickup_over_websocket() {
+    let port = start_server().await;
+    let mut ws = connect(port).await;
+    let (player_id, spawn) = join(&mut ws, "miner").await;
+
+    // Hold the starting-kit Wood Pickaxe (hotbar slot 1).
+    send(&mut ws, &ClientMessage::SelectSlot { slot: 1 }).await;
+
+    // The tile under the spawn platform's center is worldgen grass (soft ×2
+    // vs the pick's 25 power → 2 swings), and the player stands right on
+    // top of it, well inside reach and pickup range.
+    let (tx, ty) = (spawn.0, spawn.1 + 1);
+    let mut broke = false;
+    let mut saw_crack = false;
+    let mut drop: Option<(u32, ferraria_shared::items::ItemId)> = None;
+    'mining: for _ in 0..10 {
+        send(&mut ws, &ClientMessage::HitTile { x: tx, y: ty }).await;
+        // Swing cadence: the wood pickaxe needs 0.30 s between swings; the
+        // server drops faster spam.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+        while tokio::time::Instant::now() < deadline {
+            let Ok(frame) = tokio::time::timeout_at(deadline, ws.next()).await else {
+                break; // cadence pause elapsed: swing again
+            };
+            let frame = frame.expect("socket open").expect("clean frame");
+            let Message::Binary(bytes) = frame else {
+                continue;
+            };
+            match decode::<ServerMessage>(&bytes).expect("decodable") {
+                ServerMessage::BlockCrack { x, y, damage_frac } if (x, y) == (tx, ty) => {
+                    assert!(damage_frac > 0);
+                    saw_crack = true;
+                }
+                ServerMessage::TileChanged { x, y, tile } if (x, y) == (tx, ty) => {
+                    assert_eq!(tile.id, ferraria_shared::tiles::TileId::Air);
+                    broke = true;
+                }
+                ServerMessage::ItemDropSpawn {
+                    id,
+                    item,
+                    count,
+                    pos,
+                    ..
+                } => {
+                    assert!(count >= 1);
+                    assert!(
+                        (pos.0 - tx as f32).abs() < 2.0 && (pos.1 - ty as f32).abs() < 2.0,
+                        "drop spawns at the broken tile, got {pos:?}"
+                    );
+                    drop = Some((id, item));
+                }
+                _ => {}
+            }
+            if broke && drop.is_some() {
+                break 'mining;
+            }
+        }
+    }
+    assert!(saw_crack, "mining progress was broadcast as BlockCrack");
+    assert!(broke, "the tile broke within 10 swings");
+    let (drop_id, drop_item) = drop.expect("breaking spawned an item drop");
+
+    // Stand still next to the hole: after the 0.5 s arming delay the server
+    // auto-collects the drop into our inventory. The owner's SlotChanged is
+    // queued just before the ItemPickedUp broadcast.
+    let stack = expect(&mut ws, "SlotChanged", |m| match m {
+        ServerMessage::SlotChanged { stack: Some(s), .. } if s.item == drop_item => Some(s),
+        _ => None,
+    })
+    .await;
+    assert!(stack.count >= 1);
+    let picked_by = expect(&mut ws, "ItemPickedUp", |m| match m {
+        ServerMessage::ItemPickedUp { id, by } if id == drop_id => Some(by),
+        _ => None,
+    })
+    .await;
+    assert_eq!(picked_by, player_id, "we collected our own drop");
+}
+
 #[tokio::test]
 async fn wrong_protocol_version_is_rejected() {
     let port = start_server().await;
