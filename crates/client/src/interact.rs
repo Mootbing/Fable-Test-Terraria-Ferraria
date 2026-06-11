@@ -70,6 +70,9 @@ impl Interact {
 
     /// Handles this frame's mouse input: hold-LMB mining at the held tool's
     /// cadence, RMB door/chest interaction and hold-to-place.
+    /// `cursor_on_npc` suppresses the whole RMB half: a right-click there
+    /// talks to the hovered NPC (`app.rs` sends `TalkNpc`, §7.4) and must
+    /// not also toggle the door or place a tile behind the NPC.
     #[allow(clippy::too_many_arguments)]
     pub fn frame(
         &mut self,
@@ -79,6 +82,7 @@ impl Interact {
         slots: &[Option<InvSlot>],
         selected: u8,
         aim: Option<(u32, u32)>,
+        cursor_on_npc: bool,
         dt: f32,
     ) {
         self.swing_cd = (self.swing_cd - dt).max(0.0);
@@ -115,6 +119,11 @@ impl Interact {
             }
         }
 
+        // The RMB half belongs to the hovered NPC (doc comment above).
+        if cursor_on_npc {
+            return;
+        }
+
         // RMB press: doors toggle, chests open (the chest panel itself is
         // `ui::inventory`'s job — we only send the intent), and a held
         // Bottle goes onto a Table/Workbench cell (the §4.4 Bottle station;
@@ -128,6 +137,12 @@ impl Interact {
                 TileId::Chest => {
                     let (ox, oy) = world.multitile_origin(x, y);
                     ws.send(&ClientMessage::OpenChest { x: ox, y: oy });
+                    return;
+                }
+                // §8: right-clicking a bed sets the personal spawn (the
+                // server validates and answers with a toast).
+                TileId::Bed => {
+                    ws.send(&ClientMessage::SetBedSpawn { x, y });
                     return;
                 }
                 TileId::Table | TileId::Workbench
