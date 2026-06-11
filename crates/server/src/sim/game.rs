@@ -237,8 +237,9 @@ pub struct Sim {
     /// §5.3 spawn rolls and AI randomness.
     pub(crate) spawn_rng: Pcg32,
     /// Per-source enemy hit immunity (§0): `(entity, source)` → immune
-    /// until tick. Sources are player ids (melee) or projectile entity ids.
-    pub(crate) enemy_iframes: HashMap<(u32, u32), u64>,
+    /// until tick. [`super::combat::DamageSource`] keeps player-melee and
+    /// projectile windows in separate keyspaces (the raw ids overlap).
+    pub(crate) enemy_iframes: HashMap<(u32, super::combat::DamageSource), u64>,
     /// Cells changed by batched systems this tick, flushed as one
     /// [`ServerMessage::TilesChanged`] per subscribed player.
     tile_batch: Vec<(u32, u32)>,

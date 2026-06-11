@@ -74,6 +74,9 @@ pub struct AiState {
     pub dir: i8,
     /// §5.1: surface slimes are passive by day until damaged.
     pub passive: bool,
+    /// Damaged at least once — permanently ends §5.1 day passivity
+    /// (`passive` itself is recomputed from time/depth each tick).
+    pub aggroed: bool,
     /// Dawn flee mode (§5.2 zombies / §9 demon eyes).
     pub fleeing: bool,
     /// Grounded at the end of the last step.

@@ -37,12 +37,21 @@ pub const LAVA_SLIME_BOUNCE_MULT: f32 = 1.5;
 /// only "floats on water"; the magnitudes are canonized here.
 pub const SLIME_BUOYANCY_ACCEL: f32 = 180.0;
 pub const SLIME_FLOAT_MAX_RISE: f32 = 6.0;
+/// Grounded slimes don't slide between hops: horizontal speed multiplies by
+/// this each tick on the ground, zeroing once below the stop speed
+/// (canonized — DESIGN only says hops are impulses).
+pub const SLIME_GROUND_FRICTION: f32 = 0.8;
+pub const SLIME_STOP_SPEED: f32 = 0.1;
 
 /// Fighter walk speeds: Zombie 3.2 t/s, Skeleton 3.8 t/s.
 pub const ZOMBIE_WALK_SPEED: f32 = 3.2;
 pub const SKELETON_WALK_SPEED: f32 = 3.8;
 /// Blocked horizontally while grounded → jump vy 21 t/s (clears ~2.5 tiles).
 pub const FIGHTER_JUMP_VY: f32 = 21.0;
+/// Recovery acceleration back toward the walk speed after knockback or a
+/// turn (canonized: re-asserting the walk speed instantly would nullify
+/// knockback despite the §5.1 resists).
+pub const FIGHTER_RECOVERY_ACCEL: f32 = 30.0;
 
 /// Flier-bouncer (Demon Eye): accel 18 t/s², max 9.4 t/s, turn ≤ 90°/s.
 pub const BOUNCER_ACCEL: f32 = 18.0;
@@ -50,6 +59,10 @@ pub const BOUNCER_MAX_SPEED: f32 = 9.4;
 pub const BOUNCER_TURN_RATE_DEG: f32 = 90.0;
 /// On tile collision: reflect velocity and add vy −7.5 t/s (bounce up).
 pub const BOUNCER_BOUNCE_UP: f32 = 7.5;
+/// Below this speed the bouncer accelerates straight at the target instead
+/// of turn-rate steering — a near-zero velocity has no meaningful heading
+/// to rotate (canonized).
+pub const BOUNCER_MIN_STEER_SPEED: f32 = 0.5;
 
 /// Flier-erratic (Cave Bat): seek at max 12 t/s; every 0.25–0.6 s add a
 /// random jitter of up to ±6 t/s per axis.
@@ -60,9 +73,16 @@ pub const ERRATIC_JITTER_SPEED: f32 = 6.0;
 /// Seek acceleration toward the target (canonized; DESIGN pins only the
 /// max speed and jitter).
 pub const ERRATIC_ACCEL: f32 = 30.0;
+/// Bats slide along tiles instead of sticking: collisions reflect the
+/// blocked axis with this damping (canonized).
+pub const ERRATIC_BOUNCE_DAMPING: f32 = 0.5;
 
 /// Watchling: no jitter, straight at the player at 10.5 t/s.
 pub const WATCHLING_SPEED: f32 = 10.5;
+/// Steering acceleration back toward the straight-line chase velocity
+/// (canonized: overwriting the velocity every tick would nullify knockback
+/// despite the Watchling's 0% KB resist, §5.1).
+pub const WATCHLING_STEER_ACCEL: f32 = 30.0;
 
 /// Swooper (Ash Demon): hovers 8–12 tiles from the player...
 pub const SWOOPER_HOVER_MIN: f32 = 8.0;
@@ -72,9 +92,16 @@ pub const SWOOPER_SWOOP_SPEED: f32 = 14.0;
 /// ...and fires a volley of 4 Void Sickles every 4 s given line of sight.
 pub const SWOOPER_VOLLEY_PERIOD_SECS: f32 = 4.0;
 pub const SWOOPER_VOLLEY_COUNT: u32 = 4;
+/// Angular spread between adjacent sickles of a volley, radians (canonized).
+pub const SWOOPER_VOLLEY_SPREAD_RAD: f32 = 0.09;
 /// Hover steering acceleration / max speed (canonized).
 pub const SWOOPER_HOVER_ACCEL: f32 = 25.0;
 pub const SWOOPER_HOVER_MAX_SPEED: f32 = 8.0;
+/// Hover-ring steering gains (canonized): the fraction of the radial error
+/// fed into the steering while inside the ring, and a constant upward bias
+/// so the demon floats above ground clutter.
+pub const SWOOPER_RING_GAIN: f32 = 0.4;
+pub const SWOOPER_UPWARD_BIAS: f32 = 0.2;
 /// Time spent swooping before switching back to hover (canonized: enough to
 /// pass through the player from the hover ring).
 pub const SWOOPER_SWOOP_SECS: f32 = 1.4;

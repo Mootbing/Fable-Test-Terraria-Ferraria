@@ -123,7 +123,6 @@ pub(crate) mod test_util {
 /// time to walk into contact range.)
 #[cfg(test)]
 mod integration {
-    use super::entities::EntityKind;
     use super::test_util::*;
     use ferraria_shared::enemies::{EnemyKind, SpawnEnvironment};
     use ferraria_shared::items::{InvSlot, ItemId};
@@ -247,12 +246,9 @@ mod integration {
             .map(|s| s.count)
             .sum();
         assert!((1..=2).contains(&gel), "picked up the §5.1 gel ({gel})");
-        assert!(
-            !sim.entities
-                .map
-                .values()
-                .any(|e| matches!(e.kind, EntityKind::Enemy(_))),
-            "slime is gone"
-        );
+        // Only check *this* slime: it's night and natural spawning is live,
+        // so a fresh enemy may legitimately roll in during the ~62 ticks
+        // above (§5.2 SurfaceNight chance per player per tick).
+        assert!(!sim.entities.map.contains_key(&eid), "slime is gone");
     }
 }

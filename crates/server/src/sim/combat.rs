@@ -19,6 +19,18 @@ use super::entities::{Entity, EntityKind};
 use super::game::Sim;
 use super::survival::Hurt;
 
+/// A damage source for the §0 per-source enemy i-frame keyspace. Player
+/// ids and entity ids are independent counters that both start at 1, so a
+/// raw u32 would alias a player's melee window with an unrelated
+/// projectile's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum DamageSource {
+    /// A player's melee arc, by player id.
+    Player(u32),
+    /// A projectile in flight, by entity id.
+    Projectile(u32),
+}
+
 /// One active melee swing: the §4.1 3×3-tile arc stays live for the swing
 /// duration, hitting each enemy at most once per `ENEMY_IFRAME_TICKS`.
 #[derive(Debug, Clone, Copy)]
@@ -172,20 +184,27 @@ impl Sim {
                 .map(|(&eid, _)| eid)
                 .collect();
             for eid in hits {
-                self.hurt_enemy(eid, s.attack, pid, s.knockback, s.facing as f32, s.burn);
+                self.hurt_enemy(
+                    eid,
+                    s.attack,
+                    DamageSource::Player(pid),
+                    s.knockback,
+                    s.facing as f32,
+                    s.burn,
+                );
             }
         }
     }
 
-    /// Damages one enemy from `source` (player id for melee, projectile
-    /// entity id for arrows): §0 per-source i-frames, crit roll, the §0
-    /// damage formula vs the enemy's defense, §5.1 knockback-resist-scaled
-    /// knockback, aggro, and death.
+    /// Damages one enemy from `source`: §0 per-source i-frames, the §0
+    /// damage formula vs the enemy's defense, the crit roll (×2 the dealt
+    /// damage, §0), §5.1 knockback-resist-scaled knockback, aggro, and
+    /// death.
     pub(crate) fn hurt_enemy(
         &mut self,
         eid: u32,
         attack: u32,
-        source: u32,
+        source: DamageSource,
         knockback: f32,
         dir: f32,
         burn: Option<(f32, f32)>,
@@ -208,17 +227,18 @@ impl Sim {
             .insert((eid, source), tick + ENEMY_IFRAME_TICKS as u64);
         let data = kind.data();
         let crit = self.loot_rng.chance(CRIT_CHANCE);
-        let attack = if crit {
-            (attack as f32 * CRIT_MULT) as u32
-        } else {
-            attack
-        };
-        let damage = damage_dealt(attack, data.defense as u32);
+        let mut damage = damage_dealt(attack, data.defense as u32);
+        if crit {
+            // §0: a crit is ×2 the *dealt* damage (after defense).
+            damage = (damage as f32 * CRIT_MULT) as u32;
+        }
         e.hp = e.hp.saturating_sub(damage.min(u16::MAX as u32) as u16);
         e.hp_dirty = true;
         e.awake = true;
-        e.ai.passive = false; // §5.1: passive only until damaged
-                              // Knockback scaled by resist (−20% resist = 20% extra, §5.1).
+        // §5.1: damage permanently ends day passivity ("until damaged").
+        e.ai.passive = false;
+        e.ai.aggroed = true;
+        // Knockback scaled by resist (−20% resist = 20% extra, §5.1).
         let scale = (1.0 - data.kb_resist).max(0.0);
         if knockback > 0.0 && scale > 0.0 {
             e.vel.0 = dir.signum() * knockback * scale;
@@ -319,7 +339,8 @@ impl Sim {
         let base = (at.1 - from.1).atan2(at.0 - from.0);
         let (w, h) = ferraria_shared::physics::hitbox::VOID_SICKLE;
         for i in 0..ed::SWOOPER_VOLLEY_COUNT {
-            let spread = (i as f32 - (ed::SWOOPER_VOLLEY_COUNT - 1) as f32 / 2.0) * 0.09;
+            let spread = (i as f32 - (ed::SWOOPER_VOLLEY_COUNT - 1) as f32 / 2.0)
+                * ed::SWOOPER_VOLLEY_SPREAD_RAD;
             let a = base + spread;
             let entity = Entity::plain(
                 (from.0 - w / 2.0, from.1 - h / 2.0),
@@ -415,7 +436,14 @@ impl Sim {
         if let Some(eid) = hit {
             let burn = (item == ItemId::FlamingArrow)
                 .then_some((FLAMING_ARROW_BURN_CHANCE, FLAMING_ARROW_BURN_SECS));
-            self.hurt_enemy(eid, attack as u32, id, knockback, dir, burn);
+            self.hurt_enemy(
+                eid,
+                attack as u32,
+                DamageSource::Projectile(id),
+                knockback,
+                dir,
+                burn,
+            );
             self.despawn_entity(id, DespawnReason::Killed);
         }
     }
@@ -623,9 +651,9 @@ mod tests {
                 _ => None,
             })
             .expect("EntityHurt broadcast");
-        // §0: damage = max(1, 7 − floor(2/2)) = 6, doubled (12 → 11) on crit.
+        // §0: damage = max(1, 7 − floor(2/2)) = 6, ×2 on crit (12).
         let expect = if hurt.1 {
-            damage_dealt(14, 2)
+            damage_dealt(7, 2) * 2
         } else {
             damage_dealt(7, 2)
         };
@@ -644,8 +672,8 @@ mod tests {
         // Green Slime: −20% resist → ×1.2. Zombie: 50% → ×0.5.
         let green = hostile(&mut sim, EnemyKind::GreenSlime, 60.0);
         let zombie = hostile(&mut sim, EnemyKind::Zombie, 70.0);
-        sim.hurt_enemy(green, 1, 1, 5.0, 1.0, None);
-        sim.hurt_enemy(zombie, 1, 1, 5.0, -1.0, None);
+        sim.hurt_enemy(green, 1, DamageSource::Player(1), 5.0, 1.0, None);
+        sim.hurt_enemy(zombie, 1, DamageSource::Player(1), 5.0, -1.0, None);
         let g = sim.entities.map[&green].vel;
         let z = sim.entities.map[&zombie].vel;
         assert!((g.0 - 6.0).abs() < 1e-3, "green vx {} (5 × 1.2)", g.0);
@@ -657,20 +685,34 @@ mod tests {
         let (mut sim, _id, _epoch, _rx) = setup();
         let eid = hostile(&mut sim, EnemyKind::Zombie, 60.0);
         let hp0 = sim.entities.map[&eid].hp;
-        sim.hurt_enemy(eid, 10, 1, 0.0, 1.0, None);
+        sim.hurt_enemy(eid, 10, DamageSource::Player(1), 0.0, 1.0, None);
         let hp1 = sim.entities.map[&eid].hp;
         assert!(hp1 < hp0, "first hit lands");
         // Same source, immediately: blocked.
-        sim.hurt_enemy(eid, 10, 1, 0.0, 1.0, None);
+        sim.hurt_enemy(eid, 10, DamageSource::Player(1), 0.0, 1.0, None);
         assert_eq!(sim.entities.map[&eid].hp, hp1, "i-frames block source 1");
         // Different source: lands.
-        sim.hurt_enemy(eid, 10, 2, 0.0, 1.0, None);
+        sim.hurt_enemy(eid, 10, DamageSource::Player(2), 0.0, 1.0, None);
         let hp2 = sim.entities.map[&eid].hp;
         assert!(hp2 < hp1, "other sources unaffected");
         // After the 10-tick window: source 1 lands again.
         sim.tick += ENEMY_IFRAME_TICKS as u64;
-        sim.hurt_enemy(eid, 10, 1, 0.0, 1.0, None);
+        sim.hurt_enemy(eid, 10, DamageSource::Player(1), 0.0, 1.0, None);
         assert!(sim.entities.map[&eid].hp < hp2, "window elapsed");
+    }
+
+    #[test]
+    fn iframe_sources_distinguish_players_from_projectiles() {
+        let (mut sim, _id, _epoch, _rx) = setup();
+        let eid = hostile(&mut sim, EnemyKind::Zombie, 60.0);
+        let hp0 = sim.entities.map[&eid].hp;
+        sim.hurt_enemy(eid, 10, DamageSource::Player(5), 0.0, 1.0, None);
+        let hp1 = sim.entities.map[&eid].hp;
+        assert!(hp1 < hp0, "melee hit lands");
+        // A projectile whose entity id equals the player id is a different
+        // source: it must not be swallowed by the player's i-frame window.
+        sim.hurt_enemy(eid, 10, DamageSource::Projectile(5), 0.0, 1.0, None);
+        assert!(sim.entities.map[&eid].hp < hp1, "no keyspace aliasing");
     }
 
     #[test]
@@ -681,11 +723,11 @@ mod tests {
         sim.entities.map.get_mut(&eid).expect("demon").hp = u16::MAX; // survive the sample
                                                                       // Distinct source ids sidestep the i-frame gate per call.
         let base = damage_dealt(10, EnemyKind::AshDemon.data().defense as u32);
-        let crit = damage_dealt(20, EnemyKind::AshDemon.data().defense as u32);
+        let crit = base * 2; // §0: ×2 the dealt damage
         let (mut crits, trials) = (0u32, 3000u32);
         for source in 0..trials {
             let before = sim.entities.map[&eid].hp;
-            sim.hurt_enemy(eid, 10, source + 100, 0.0, 1.0, None);
+            sim.hurt_enemy(eid, 10, DamageSource::Player(source + 100), 0.0, 1.0, None);
             let dealt = (before - sim.entities.map[&eid].hp) as u32;
             if dealt == crit {
                 crits += 1;
@@ -771,10 +813,11 @@ mod tests {
                 _ => None,
             })
             .expect("arrow hit the zombie");
-        // §4.1: attack = bow 4 + arrow 5 = 9, vs the zombie's §5.1 defense.
+        // §4.1: attack = bow 4 + arrow 5 = 9, vs the zombie's §5.1 defense
+        // (×2 the dealt damage on crit, §0).
         let def = EnemyKind::Zombie.data().defense as u32;
         let expect = if hurt.1 {
-            damage_dealt(18, def)
+            damage_dealt(9, def) * 2
         } else {
             damage_dealt(9, def)
         };
@@ -853,7 +896,7 @@ mod tests {
         advance(&mut sim, 30);
         assert_eq!(sim.players[&id].hp, 100, "passive slime is harmless");
         // Hit it once: aggro.
-        sim.hurt_enemy(eid, 1, id, 0.0, 1.0, None);
+        sim.hurt_enemy(eid, 1, DamageSource::Player(id), 0.0, 1.0, None);
         assert!(!sim.entities.map[&eid].ai.passive);
         // Drop it back onto the player and let contact land.
         if let Some(e) = sim.entities.map.get_mut(&eid) {

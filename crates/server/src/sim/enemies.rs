@@ -221,6 +221,14 @@ impl Sim {
             if is_day && kind.flees_at_dawn() {
                 body.ai.fleeing = true;
             }
+            // §5.1: "passive on the surface during the day until damaged;
+            // always hostile at night or underground" — recompute passivity
+            // from those conditions every tick, so dusk (or hopping down
+            // into the underground band) angers an untouched slime and dawn
+            // calms it again. Only damage (`ai.aggroed`) is permanent.
+            if kind.day_passive_slime() {
+                body.ai.passive = slime_passive(body.ai.aggroed, body.center().1, is_day);
+            }
 
             // Nearest living target this enemy will chase. Royal Gel Charm
             // wearers are invisible to green/blue slimes (§4.3).
@@ -362,6 +370,15 @@ fn secs_ticks(secs: f32) -> u32 {
     ((secs * TICK_RATE as f32) as u32).max(1)
 }
 
+/// §5.1 passivity for green/blue slimes: passive iff never damaged, above
+/// the underground band, and it's daytime. Read straight off the spec
+/// sentence: "passive on the surface during the day **until damaged**"
+/// scopes permanence to damage alone, so a slime made hostile by dusk
+/// re-passivates at dawn if nobody ever hit it.
+pub(crate) fn slime_passive(aggroed: bool, center_y: f32, is_day: bool) -> bool {
+    !aggroed && is_day && center_y < ed::UNDERGROUND_START_ROW as f32
+}
+
 /// §5.3 step 4 placement: grounded enemies need a solid tile with 3×2 air
 /// above (the enemy stands on top, horizontally centered); fliers need a
 /// 2×2 air pocket. Returns the AABB top-left, or `None`.
@@ -423,8 +440,8 @@ pub(crate) fn step_slime(
 
     if step.on_ground {
         // Grounded: bleed horizontal speed quickly (slimes don't slide).
-        body.vel.0 *= 0.8;
-        if body.vel.0.abs() < 0.1 {
+        body.vel.0 *= ed::SLIME_GROUND_FRICTION;
+        if body.vel.0.abs() < ed::SLIME_STOP_SPEED {
             body.vel.0 = 0.0;
         }
         if body.ai.timer > 0 {
@@ -511,7 +528,8 @@ pub(crate) fn step_fighter(
     let want = speed * body.ai.dir as f32;
     if (body.vel.0 - want).abs() > speed || body.vel.0.signum() != want.signum() {
         // Knocked back / turned: decay toward the walk velocity.
-        body.vel.0 += (want - body.vel.0).clamp(-30.0 * DT, 30.0 * DT);
+        let max = ed::FIGHTER_RECOVERY_ACCEL * DT;
+        body.vel.0 += (want - body.vel.0).clamp(-max, max);
     } else {
         body.vel.0 = want;
     }
@@ -535,7 +553,7 @@ pub(crate) fn step_bouncer(world: &World, body: &mut Entity, target: Option<(f32
     };
     if desired != (0.0, 0.0) {
         let speed = len(body.vel);
-        if speed > 0.5 {
+        if speed > ed::BOUNCER_MIN_STEER_SPEED {
             // Turn-rate-limited steering: rotate the velocity toward the
             // desired heading at ≤ BOUNCER_TURN_RATE_DEG °/s, accelerating
             // along the (rotated) heading.
@@ -605,21 +623,26 @@ pub(crate) fn step_erratic(
     let step = step_flier_body(world, &mut body.pos, &mut body.vel, size, DT);
     // Bats slide along tiles rather than sticking to them.
     if step.blocked_x {
-        body.vel.0 = -pre.0 * 0.5;
+        body.vel.0 = -pre.0 * ed::ERRATIC_BOUNCE_DAMPING;
     }
     if step.on_ground || step.hit_ceiling {
-        body.vel.1 = -pre.1 * 0.5;
+        body.vel.1 = -pre.1 * ed::ERRATIC_BOUNCE_DAMPING;
     }
 }
 
 /// Watchling: no jitter — straight at the player at 10.5 t/s, blocked by
-/// tiles normally (§5.2).
+/// tiles normally (§5.2). Steers *toward* the chase velocity instead of
+/// overwriting it each tick, so knockback actually displaces it (§5.1:
+/// 0% KB resist, not immunity).
 pub(crate) fn step_straight(world: &World, body: &mut Entity, target: Option<(f32, f32)>) {
     let size = body.size();
     let center = body.center();
     if let Some(t) = target {
         let d = norm((t.0 - center.0, t.1 - center.1));
-        body.vel = (d.0 * ed::WATCHLING_SPEED, d.1 * ed::WATCHLING_SPEED);
+        let want = (d.0 * ed::WATCHLING_SPEED, d.1 * ed::WATCHLING_SPEED);
+        let max = ed::WATCHLING_STEER_ACCEL * DT;
+        body.vel.0 += (want.0 - body.vel.0).clamp(-max, max);
+        body.vel.1 += (want.1 - body.vel.1).clamp(-max, max);
     }
     step_flier_body(world, &mut body.pos, &mut body.vel, size, DT);
 }
@@ -650,11 +673,12 @@ pub(crate) fn step_swooper(
                 } else if dist < ed::SWOOPER_HOVER_MIN {
                     -1.0
                 } else {
-                    (dist - mid) / mid * 0.4
+                    (dist - mid) / mid * ed::SWOOPER_RING_GAIN
                 };
                 let d = (to.0 / dist, to.1 / dist);
                 body.vel.0 += d.0 * radial * ed::SWOOPER_HOVER_ACCEL * DT;
-                body.vel.1 += (d.1 * radial - 0.2) * ed::SWOOPER_HOVER_ACCEL * DT;
+                body.vel.1 +=
+                    (d.1 * radial - ed::SWOOPER_UPWARD_BIAS) * ed::SWOOPER_HOVER_ACCEL * DT;
                 let speed = len(body.vel);
                 if speed > ed::SWOOPER_HOVER_MAX_SPEED {
                     let s = ed::SWOOPER_HOVER_MAX_SPEED / speed;
@@ -869,6 +893,94 @@ mod tests {
             vy <= -ed::BOUNCER_BOUNCE_UP + 0.5,
             "upward kick applied (vy {vy})"
         );
+    }
+
+    #[test]
+    fn watchling_knockback_decays_instead_of_being_overwritten() {
+        let world = flat_world(200, 100, 90);
+        let mut w = enemy_on_floor(EnemyKind::Watchling, 50.0, 40);
+        w.pos.1 = 30.0; // airborne
+        let target = Some((80.0, 32.0));
+        // Settle into the straight chase first.
+        for _ in 0..60 {
+            step_straight(&world, &mut w, target);
+        }
+        assert!(w.vel.0 > ed::WATCHLING_SPEED * 0.8, "chasing right");
+        // Fresh knockback against the chase direction (§5.1: 0% resist, so
+        // the full impulse applies) must not be erased on the next tick.
+        w.vel = (-8.0, -4.0);
+        step_straight(&world, &mut w, target);
+        assert!(
+            w.vel.0 < -6.0,
+            "one tick must not erase knockback (vx {})",
+            w.vel.0
+        );
+        // ...but it steers back to the §5.2 chase velocity within ~a second.
+        for _ in 0..90 {
+            step_straight(&world, &mut w, target);
+        }
+        assert!(
+            w.vel.0 > ed::WATCHLING_SPEED * 0.7,
+            "recovered the chase (vx {})",
+            w.vel.0
+        );
+    }
+
+    // ---- §5.1 slime passivity ---------------------------------------------------
+
+    #[test]
+    fn slime_passivity_follows_damage_depth_and_daylight() {
+        let surface = (ed::UNDERGROUND_START_ROW - 1) as f32;
+        assert!(slime_passive(false, surface, true), "day surface: passive");
+        assert!(!slime_passive(false, surface, false), "night: hostile");
+        assert!(
+            !slime_passive(false, ed::UNDERGROUND_START_ROW as f32, true),
+            "underground: hostile even by day"
+        );
+        assert!(!slime_passive(true, surface, true), "damaged: hostile");
+    }
+
+    #[test]
+    fn dusk_angers_passive_slimes_and_dawn_calms_only_the_undamaged() {
+        let mut sim = flat_sim(100, 60, 30);
+        assert!(sim.world.is_day());
+        let a = sim.spawn_enemy(
+            EnemyKind::GreenSlime,
+            (40.0, 28.0),
+            SpawnEnvironment::SurfaceDay,
+        );
+        let b = sim.spawn_enemy(
+            EnemyKind::BlueSlime,
+            (60.0, 28.0),
+            SpawnEnvironment::SurfaceDay,
+        );
+        advance(&mut sim, 1);
+        assert!(sim.entities.map[&a].ai.passive && sim.entities.map[&b].ai.passive);
+
+        // Dusk: both turn hostile without ever being touched (§5.1 "always
+        // hostile at night").
+        sim.world.time = 0;
+        advance(&mut sim, 1);
+        assert!(!sim.entities.map[&a].ai.passive, "hostile at night");
+        assert!(!sim.entities.map[&b].ai.passive, "hostile at night");
+
+        // Damage one during the night; at dawn only the untouched slime
+        // re-passivates ("until damaged" is the one permanent aggro).
+        sim.hurt_enemy(
+            a,
+            1,
+            super::super::combat::DamageSource::Player(1),
+            0.0,
+            1.0,
+            None,
+        );
+        sim.world.time = NEW_WORLD_TIME;
+        advance(&mut sim, 1);
+        assert!(
+            !sim.entities.map[&a].ai.passive,
+            "damage aggro is permanent"
+        );
+        assert!(sim.entities.map[&b].ai.passive, "undamaged: docile by day");
     }
 
     // ---- §5.3 placement & spawn-algorithm tests --------------------------------
